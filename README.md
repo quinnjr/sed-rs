@@ -19,7 +19,7 @@ cargo install sed-rs
 Or build from source:
 
 ```bash
-git clone https://github.com/PegasusHeavyIndustries/sed-rs.git
+git clone https://github.com/pegasusheavy/sed-rs.git
 cd sed-rs
 cargo build --release
 # binary is at target/release/sed
