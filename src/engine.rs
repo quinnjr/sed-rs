@@ -761,7 +761,9 @@ fn apply_substitution(
         match_count += 1;
 
         let should_replace = match nth {
-            Some(n) => match_count == n,
+            // `s///Ng` replaces the Nth match and every match after it;
+            // `s///N` (no g) replaces only the Nth.
+            Some(n) => match_count == n || (global && match_count > n),
             None => global || match_count == 1,
         };
 
@@ -1624,6 +1626,12 @@ mod tests {
     #[test]
     fn sub_nth_3() {
         assert_eq!(run_sed("s/a/X/3", "aaaaa\n"), "aaXaa\n");
+    }
+
+    #[test]
+    fn sub_nth_global() {
+        // `Ng` replaces the Nth match and all matches after it.
+        assert_eq!(run_sed("s/a/X/2g", "aaaaa\n"), "aXXXX\n");
     }
 
     #[test]
