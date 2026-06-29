@@ -12,7 +12,7 @@ documentation = "https://docs.rs/sed-rs"
 readme = "README.md"
 categories = ["command-line-utilities", "text-processing"]
 keywords = ["sed", "text", "replace", "regex", "stream-editor"]
-exclude = [".github/", ".gitignore", "tests/", ".cursor/"]
+exclude = [".github/", ".gitignore", "tests/", ".cursor/", "CLAUDE.md"]
 
 [lib]
 name = "sed_rs"
