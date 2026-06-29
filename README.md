@@ -92,10 +92,13 @@ find . -name '*.txt' -print0 | sed -z 's/\n/ /g'
 | Hold space | `h`, `H`, `g`, `G`, `x` |
 | Text | `a` (append), `i` (insert), `c` (change) |
 | Branching | `:label`, `b`, `t`, `T` |
-| Files | `r` (read), `w` (write) |
+| Files | `r` (read file), `R` (read one line per cycle), `w` (write), `W` (write first line) |
+| GNU extensions | `F` (print input file name), `e` (execute shell command), `v` (require version — no-op) |
 | Control / grouping | `q`, `Q`, `z` (zap), `{ … }` |
 
 The `s///` command supports the `g`, `p`, `i`/`I` (case-insensitive), `w FILE`, and numeric *N*th-occurrence flags — and they combine, e.g. `s/x/y/2g` replaces from the 2nd match onward.
+
+> **`e` runs shell commands.** `e command` runs `command` via `sh -c` and writes its output to the stream; bare `e` runs the pattern space and replaces it with the output. Only run scripts you trust.
 
 ### Addressing
 

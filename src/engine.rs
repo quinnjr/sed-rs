@@ -85,7 +85,11 @@ enum CompiledCommand {
     BranchIfSub(Option<String>),
     BranchIfNotSub(Option<String>),
     ReadFile(String),
+    ReadLine(String),
     WriteFile(String),
+    WriteFirstLine(String),
+    PrintFileName,
+    Execute(Option<String>),
     Quit(Option<i32>),
     QuitNoprint(Option<i32>),
     ClearPattern,
@@ -137,6 +141,11 @@ struct State {
     last_sub_success: bool,
     /// Tracks whether each range-addressed command is currently "in range"
     range_active: Vec<bool>,
+    /// Name of the current input file (for the `F` command); "-" for stdin.
+    filename: String,
+    /// Open readers for `R`, keyed by path. `None` means the file could not
+    /// be opened; the entry is cached so we don't retry every cycle.
+    r_readers: HashMap<String, Option<io::Lines<io::BufReader<fs::File>>>>,
 }
 
 impl State {
@@ -149,6 +158,8 @@ impl State {
             append_queue: Vec::new(),
             last_sub_success: false,
             range_active: vec![false; num_commands],
+            filename: "-".to_string(),
+            r_readers: HashMap::new(),
         }
     }
 }
@@ -203,7 +214,11 @@ impl Engine {
                 }
                 let file = fs::File::open(path)?;
                 let reader = io::BufReader::new(file);
-                self.process_stream(reader, &mut out)?;
+                self.process_named(
+                    reader,
+                    &mut out,
+                    &path.display().to_string(),
+                )?;
             }
         }
 
@@ -232,7 +247,11 @@ impl Engine {
             let mut output = Vec::new();
             {
                 let mut cursor = io::Cursor::new(&mut output);
-                self.process_stream(reader, &mut cursor)?;
+                self.process_named(
+                    reader,
+                    &mut cursor,
+                    &path.display().to_string(),
+                )?;
             }
 
             // Create backup if suffix is non-empty
@@ -261,8 +280,20 @@ impl Engine {
         reader: R,
         writer: &mut W,
     ) -> Result<()> {
+        self.process_named(reader, writer, "-")
+    }
+
+    /// Like [`process_stream`], but records the input file name so the `F`
+    /// command can report it.
+    fn process_named<R: BufRead, W: Write>(
+        &self,
+        reader: R,
+        writer: &mut W,
+        filename: &str,
+    ) -> Result<()> {
         let mut line_reader = LineReader::new(reader, self.null_data);
         let mut state = State::new(self.commands.len());
+        state.filename = filename.to_string();
 
         while let Some((line, is_last)) = line_reader.read_line()? {
             state.line_number += 1;
@@ -613,6 +644,70 @@ impl Engine {
                     .append(true)
                     .open(path)?;
                 writeln!(f, "{}", state.pattern_space)?;
+            }
+            CompiledCommand::WriteFirstLine(path) => {
+                // `W`: write only the first line of the pattern space.
+                let first = match state.pattern_space.find('\n') {
+                    Some(pos) => &state.pattern_space[..pos],
+                    None => &state.pattern_space,
+                };
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                writeln!(f, "{}", first)?;
+            }
+            CompiledCommand::ReadLine(path) => {
+                // `R`: queue one line from the file per cycle. The reader
+                // is opened lazily and advanced on each invocation; when
+                // the file is exhausted the command does nothing.
+                let line = {
+                    let reader =
+                        state.r_readers.entry(path.clone()).or_insert_with(
+                            || {
+                                fs::File::open(path).ok().map(|f| {
+                                    io::BufReader::new(f).lines()
+                                })
+                            },
+                        );
+                    reader
+                        .as_mut()
+                        .and_then(|lines| lines.next())
+                        .and_then(|r| r.ok())
+                };
+                if let Some(line) = line {
+                    state.append_queue.push(line);
+                }
+            }
+            CompiledCommand::PrintFileName => {
+                self.write_line(writer, &state.filename)?;
+            }
+            CompiledCommand::Execute(cmd) => {
+                let to_run = match cmd {
+                    Some(c) => c.clone(),
+                    None => state.pattern_space.clone(),
+                };
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&to_run)
+                    .output()?;
+                let mut stdout =
+                    String::from_utf8_lossy(&output.stdout).into_owned();
+                match cmd {
+                    None => {
+                        // `e` with no argument: replace the pattern space
+                        // with the command output, dropping one trailing
+                        // newline.
+                        if stdout.ends_with('\n') {
+                            stdout.pop();
+                        }
+                        state.pattern_space = stdout;
+                    }
+                    Some(_) => {
+                        // `e command`: send the output to the stream as-is.
+                        write!(writer, "{}", stdout)?;
+                    }
+                }
             }
 
             CompiledCommand::Quit(code) => {
@@ -1137,10 +1232,13 @@ fn compile_single_command(cmd: Command) -> Result<CompiledCommand> {
             Ok(CompiledCommand::BranchIfNotSub(l))
         }
         Command::ReadFile(f) => Ok(CompiledCommand::ReadFile(f)),
+        Command::ReadLine(f) => Ok(CompiledCommand::ReadLine(f)),
         Command::WriteFile(f) => Ok(CompiledCommand::WriteFile(f)),
         Command::WriteFirstLine(f) => {
-            Ok(CompiledCommand::WriteFile(f))
+            Ok(CompiledCommand::WriteFirstLine(f))
         }
+        Command::PrintFileName => Ok(CompiledCommand::PrintFileName),
+        Command::Execute(c) => Ok(CompiledCommand::Execute(c)),
         Command::Quit(c) => Ok(CompiledCommand::Quit(c)),
         Command::QuitNoprint(c) => Ok(CompiledCommand::QuitNoprint(c)),
         Command::ClearPattern => Ok(CompiledCommand::ClearPattern),
@@ -1189,6 +1287,61 @@ mod tests {
     #[test]
     fn substitute_basic() {
         assert_eq!(run_sed("s/foo/bar/", "foo\n"), "bar\n");
+    }
+
+    #[test]
+    fn execute_command_arg() {
+        // `e command` sends the command's output to the stream, then the
+        // pattern space is auto-printed.
+        assert_eq!(run_sed("1e echo INJECTED", "hello\n"), "INJECTED\nhello\n");
+    }
+
+    #[test]
+    fn execute_pattern_space() {
+        // `e` with no argument runs the pattern space and replaces it.
+        assert_eq!(run_sed("e", "echo hi\n"), "hi\n");
+    }
+
+    #[test]
+    fn version_is_noop() {
+        // `v VERSION` does nothing and `;` terminates its argument.
+        assert_eq!(run_sed("v 4.2; s/foo/bar/", "foo\n"), "bar\n");
+    }
+
+    #[test]
+    fn read_line_interleaves() {
+        // `R` queues one line of the file per cycle.
+        use std::io::Write as _;
+        let mut extra = tempfile::NamedTempFile::new().unwrap();
+        write!(extra, "X\nY\nZ\n").unwrap();
+        let script = format!("R {}", extra.path().display());
+        assert_eq!(run_sed(&script, "a\nb\nc\n"), "a\nX\nb\nY\nc\nZ\n");
+    }
+
+    #[test]
+    fn write_first_line_only() {
+        // `W` writes only the first line of the pattern space.
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let path = target.path().to_path_buf();
+        let script = format!("N; W {}", path.display());
+        run_sed(&script, "one\ntwo\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn print_file_name() {
+        // `F` prints the current input file name.
+        let parsed = command::parse("F").unwrap();
+        let engine = Engine::new(parsed, &Options::default()).unwrap();
+        let mut out = Vec::new();
+        engine
+            .process_named(
+                io::BufReader::new(io::Cursor::new(b"x\n".as_ref())),
+                &mut out,
+                "my.txt",
+            )
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "my.txt\nx\n");
     }
 
     #[test]

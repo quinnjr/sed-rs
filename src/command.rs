@@ -81,8 +81,16 @@ pub enum Command {
 
     // -- I/O --
     ReadFile(String),
+    /// GNU extension: read one line per cycle from a file (`R`)
+    ReadLine(String),
     WriteFile(String),
     WriteFirstLine(String),
+    /// GNU extension: print the current input file name (`F`)
+    PrintFileName,
+    /// GNU extension: execute a shell command (`e`).
+    /// `None` runs the pattern space and replaces it with the output;
+    /// `Some(cmd)` runs `cmd` and sends its output to the stream.
+    Execute(Option<String>),
 
     // -- Control --
     Quit(Option<i32>),
@@ -237,7 +245,23 @@ impl Parser {
             'r' => Command::ReadFile(self.parse_filename_arg()),
             'w' => Command::WriteFile(self.parse_filename_arg()),
             'W' => Command::WriteFirstLine(self.parse_filename_arg()),
-            'R' => Command::ReadFile(self.parse_filename_arg()),
+            'R' => Command::ReadLine(self.parse_filename_arg()),
+            'F' => Command::PrintFileName,
+            'e' => {
+                let arg = self.parse_rest_of_line();
+                Command::Execute(if arg.is_empty() {
+                    None
+                } else {
+                    Some(arg)
+                })
+            }
+            // GNU `v [version]` asserts a minimum sed version and enables
+            // GNU extensions. They are always on here, so it's a no-op.
+            // The version is a single token; `;` terminates it (unlike `e`).
+            'v' => {
+                let _ = self.parse_label_arg();
+                Command::Noop
+            }
             'b' => Command::Branch(self.parse_label_arg()),
             't' => Command::BranchIfSub(self.parse_label_arg()),
             'T' => Command::BranchIfNotSub(self.parse_label_arg()),
@@ -563,6 +587,22 @@ impl Parser {
             self.advance();
         }
         filename.trim_end().to_string()
+    }
+
+    /// Parse the rest of the line as a single argument (for `e`, `v`).
+    /// Unlike `parse_filename_arg`, `;` is not a terminator — the
+    /// argument runs to the end of the line, matching GNU sed.
+    fn parse_rest_of_line(&mut self) -> String {
+        self.skip_spaces();
+        let mut s = String::new();
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                break;
+            }
+            s.push(c);
+            self.advance();
+        }
+        s.trim_end().to_string()
     }
 
     /// Parse a { ... } block of commands.
