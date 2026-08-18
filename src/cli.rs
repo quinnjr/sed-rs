@@ -7,9 +7,9 @@ use std::path::PathBuf;
     version,
     about = "A GNU-compatible stream editor implemented in Rust",
     long_about = "A GNU-compatible stream editor implemented in Rust.\n\n\
-        Uses Rust regex syntax (similar to PCRE/ERE). The -E/-r flags are \
-        accepted for compatibility but are no-ops since extended regex \
-        syntax is always used.",
+        Patterns are basic regular expressions (BRE) by default, as in GNU \
+        sed; pass -E/-r for extended regular expressions (ERE). \
+        Backreferences within patterns are not supported.",
     max_term_width = 100
 )]
 pub struct Options {
@@ -36,7 +36,7 @@ pub struct Options {
     )]
     pub in_place: Option<String>,
 
-    /// Use extended regular expressions (accepted for compatibility; always enabled)
+    /// Use extended regular expressions instead of basic regular expressions
     #[arg(short = 'E', short_alias = 'r', long = "regexp-extended")]
     pub extended_regexp: bool,
 
@@ -75,14 +75,10 @@ impl Options {
         if scripts.is_empty() {
             // First positional arg is the script, rest are files
             if let Some((first, rest)) = self.args.split_first() {
-                Ok((
-                    first.clone(),
-                    rest.iter().map(PathBuf::from).collect(),
-                ))
+                Ok((first.clone(), rest.iter().map(PathBuf::from).collect()))
             } else {
                 Err(crate::Error::Parse(
-                    "no script provided. Usage: sed [OPTIONS] SCRIPT [FILE...]"
-                        .into(),
+                    "no script provided. Usage: sed [OPTIONS] SCRIPT [FILE...]".into(),
                 ))
             }
         } else {
@@ -151,20 +147,13 @@ mod tests {
             "file".into(),
         ];
         let processed = preprocess_args(args.into_iter());
-        assert_eq!(
-            processed,
-            vec!["sed", "--in-place", "s/foo/bar/", "file"]
-        );
+        assert_eq!(processed, vec!["sed", "--in-place", "s/foo/bar/", "file"]);
     }
 
     #[test]
     fn preprocess_i_suffix() {
-        let args =
-            vec!["sed".into(), "-i.bak".into(), "s/foo/bar/".into()];
+        let args = vec!["sed".into(), "-i.bak".into(), "s/foo/bar/".into()];
         let processed = preprocess_args(args.into_iter());
-        assert_eq!(
-            processed,
-            vec!["sed", "--in-place=.bak", "s/foo/bar/"]
-        );
+        assert_eq!(processed, vec!["sed", "--in-place=.bak", "s/foo/bar/"]);
     }
 }
