@@ -214,11 +214,19 @@ impl Parser {
         let address = self.parse_address_range()?;
         self.skip_spaces();
         let has_address = !matches!(address, AddressRange::None);
+        // GNU sed rejects an address that isn't followed by a command
+        // on the same line, and commands like `:` and `#` that don't
+        // accept addresses at all.
+        let reject_address = |msg: &str| -> Result<()> {
+            if has_address {
+                Err(Error::Parse(msg.into()))
+            } else {
+                Ok(())
+            }
+        };
 
         let Some(ch) = self.advance() else {
-            if has_address {
-                return Err(Error::Parse("missing command".into()));
-            }
+            reject_address("missing command")?;
             return Ok(None);
         };
 
@@ -230,9 +238,7 @@ impl Parser {
             '}' => {
                 // Closing brace is handled by parse_block; an address
                 // directly before '}' means its command is missing.
-                if has_address {
-                    return Err(Error::Parse("missing command".into()));
-                }
+                reject_address("missing command")?;
                 return Ok(None);
             }
             's' => self.parse_substitute()?,
@@ -276,26 +282,21 @@ impl Parser {
             't' => Command::BranchIfSub(self.parse_label_arg()),
             'T' => Command::BranchIfNotSub(self.parse_label_arg()),
             ':' => {
+                reject_address(": doesn't want any addresses")?;
                 let label = self.parse_label_arg().unwrap_or_default();
                 Command::Label(label)
             }
             '#' => {
-                if has_address {
-                    return Err(Error::Parse("comments don't accept any addresses".into()));
-                }
+                reject_address("comments don't accept any addresses")?;
                 self.skip_line();
                 Command::Noop
             }
             ';' => {
-                if has_address {
-                    return Err(Error::Parse("missing command".into()));
-                }
+                reject_address("missing command")?;
                 return self.parse_one_command();
             }
             c if c.is_whitespace() => {
-                if has_address {
-                    return Err(Error::Parse("missing command".into()));
-                }
+                reject_address("missing command")?;
                 return self.parse_one_command();
             }
             c => {
@@ -811,6 +812,13 @@ mod tests {
     #[test]
     fn comment_after_address_is_error() {
         assert!(parse("1 # comment").is_err());
+    }
+
+    #[test]
+    fn label_with_address_is_error() {
+        assert!(parse("1:loop").is_err());
+        assert!(parse("/foo/ :loop").is_err());
+        assert!(parse(":loop").is_ok());
     }
 
     #[test]

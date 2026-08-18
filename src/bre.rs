@@ -28,6 +28,18 @@ pub(crate) fn parse_digits(chars: &[char], i: &mut usize, radix: u32, max: usize
     if n == 0 { None } else { Some(val) }
 }
 
+/// Parse the digits of a `\xHH` / `\oNNN` / `\dNNN` character escape
+/// (after the letter), returning the decoded value. `None` if no digit
+/// of the right radix follows.
+pub(crate) fn parse_escape_value(kind: char, chars: &[char], i: &mut usize) -> Option<u32> {
+    let (radix, max) = match kind {
+        'x' => (16, 2),
+        'o' => (8, 3),
+        _ => (10, 3),
+    };
+    parse_digits(chars, i, radix, max)
+}
+
 pub(crate) fn translate_pattern(pattern: &str, extended: bool) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len() + 8);
@@ -45,25 +57,14 @@ pub(crate) fn translate_pattern(pattern: &str, extended: bool) -> String {
                 let next = chars[i + 1];
                 i += 2;
                 match next {
-                    'x' => {
-                        match parse_digits(&chars, &mut i, 16, 2) {
+                    'x' | 'o' | 'd' => {
+                        match parse_escape_value(next, &chars, &mut i) {
                             Some(v) => out.push_str(&format!("\\x{{{v:X}}}")),
-                            None => out.push('x'),
+                            // Bare `\d` keeps the Rust regex digit-class
+                            // meaning; `\x`/`\o` degrade to the letter.
+                            None if next == 'd' => out.push_str("\\d"),
+                            None => out.push(next),
                         }
-                        prev_atom = true;
-                        at_subexpr_start = false;
-                    }
-                    'o' => {
-                        match parse_digits(&chars, &mut i, 8, 3) {
-                            Some(v) => out.push_str(&format!("\\x{{{v:X}}}")),
-                            None => out.push('o'),
-                        }
-                        prev_atom = true;
-                        at_subexpr_start = false;
-                    }
-                    'd' if chars.get(i).is_some_and(|c| c.is_ascii_digit()) => {
-                        let v = parse_digits(&chars, &mut i, 10, 3).unwrap();
-                        out.push_str(&format!("\\x{{{v:X}}}"));
                         prev_atom = true;
                         at_subexpr_start = false;
                     }
@@ -188,6 +189,12 @@ fn copy_bracket_expression(chars: &[char], i: &mut usize, out: &mut String) {
             out.push(']');
             *i += 1;
             return;
+        } else if c == '\\' && chars.get(*i + 1) == Some(&']') {
+            // GNU treats a backslash before `]` as a literal backslash
+            // (the `]` still closes the class); double it so the regex
+            // crate doesn't read `\]` as an escaped bracket.
+            out.push_str("\\\\");
+            *i += 1;
         } else {
             out.push(c);
             *i += 1;
@@ -261,5 +268,16 @@ mod tests {
         assert_eq!(translate_pattern("[a+?(]", false), "[a+?(]");
         assert_eq!(translate_pattern("[^]a]", false), "[^]a]");
         assert_eq!(translate_pattern("[[:alpha:]+]", false), "[[:alpha:]+]");
+    }
+
+    #[test]
+    fn bracket_backslash_before_closing_is_literal() {
+        // GNU: `[\]` is a class holding a literal backslash; the `]`
+        // still closes it. The regex crate would read `\]` as an
+        // escaped bracket, so the backslash must be doubled.
+        assert_eq!(translate_pattern(r"[\]", false), r"[\\]");
+        assert_eq!(translate_pattern(r"[a\]b", false), r"[a\\]b");
+        // Other in-class escapes pass through (regex handles \n, \t…)
+        assert_eq!(translate_pattern(r"[\n\t]", false), r"[\n\t]");
     }
 }

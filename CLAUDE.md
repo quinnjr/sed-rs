@@ -32,7 +32,7 @@ The pipeline is three stages, mirrored by three modules:
 
 3. **`cli.rs` — argument handling.** clap `derive` `Options`, but `-i`/`-iSUFFIX` can't be expressed in clap (optional attached value on a short flag), so **`preprocess_args` rewrites `argv` before clap sees it** (`-i` → `--in-place`, `-iSUFFIX` → `--in-place=SUFFIX`), respecting `--`. `script_and_files()` resolves the script: from `-e`/`-f` if present (joined with `\n`), otherwise the first positional arg is the script and the rest are files.
 
-`lib.rs` wraps stages 1–2 in the public API: `eval(script, input)` one-shot, and the `Sed` builder (`.quiet()`, `.null_data()`, `.extended_regexp()`, `.eval()`/`.eval_bytes()`/`.eval_stream()`). `Sed::new` parses + compiles eagerly to surface script errors immediately, but re-parses on each `eval*` call. `unescape.rs` handles `\n`/`\t`/`\\` etc. in replacement text and `y///` arguments; `error.rs` is a `thiserror` enum. The binary exits `2` on any error (GNU sed convention).
+`lib.rs` wraps stages 1–2 in the public API: `eval(script, input)` one-shot, and the `Sed` builder (`.quiet()`, `.null_data()`, `.extended_regexp()`, `.eval()`/`.eval_bytes()`/`.eval_stream()`). `Sed::new` parses + compiles eagerly to surface script errors immediately, but re-parses on each `eval*` call. Replacement text is pre-compiled by `compile_replacement` in `engine.rs` (escapes decoded once into `ReplacePart` literals/group refs); `error.rs` is a `thiserror` enum. The binary exits `2` on any error (GNU sed convention).
 
 ## Conventions
 

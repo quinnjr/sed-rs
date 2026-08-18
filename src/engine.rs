@@ -14,7 +14,7 @@ use std::path::Path;
 
 use regex::Regex;
 
-use crate::bre::{parse_digits, translate_pattern};
+use crate::bre::{parse_escape_value, translate_pattern};
 use crate::cli::Options;
 use crate::command::{Address, AddressRange, Command, SedCommand};
 use crate::error::{Error, Result};
@@ -52,7 +52,7 @@ impl CompiledAddressRange {
 
 struct CompiledSubstitute {
     pattern: Regex,
-    replacement: String,
+    replacement: Vec<ReplacePart>,
     global: bool,
     print: bool,
     nth: Option<usize>,
@@ -751,12 +751,90 @@ fn addr_matches_line(addr: &CompiledAddress, state: &State) -> bool {
 // Substitution (inspired by sd's replacer)
 // ---------------------------------------------------------------------------
 
+/// One piece of a pre-compiled `s///` replacement: literal text (with
+/// escapes already decoded) or a capture-group reference (`&` is group 0).
+enum ReplacePart {
+    Literal(String),
+    Group(usize),
+}
+
+/// Pre-compile a sed-style replacement string into parts, decoding
+/// escapes once at script-compile time.
+///
+/// Handles:
+///   &        → whole match ($0)
+///   \1..\9   → numbered capture group
+///   \n \t \r → newline / tab / carriage return
+///   \a \f \v → BEL / form feed / vertical tab
+///   \xHH     → character with hex value HH
+///   \oNNN    → character with octal value NNN
+///   \dNNN    → character with decimal value NNN
+///   \\       → literal backslash
+///   \&       → literal &
+fn compile_replacement(replacement: &str) -> Vec<ReplacePart> {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let flush = |lit: &mut String, parts: &mut Vec<ReplacePart>| {
+        if !lit.is_empty() {
+            parts.push(ReplacePart::Literal(std::mem::take(lit)));
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '&' {
+            flush(&mut lit, &mut parts);
+            parts.push(ReplacePart::Group(0));
+            i += 1;
+            continue;
+        }
+        if c != '\\' {
+            lit.push(c);
+            i += 1;
+            continue;
+        }
+        let Some(&next) = chars.get(i + 1) else {
+            lit.push('\\');
+            break;
+        };
+        i += 2;
+        match next {
+            '0'..='9' => {
+                flush(&mut lit, &mut parts);
+                parts.push(ReplacePart::Group((next as u8 - b'0') as usize));
+            }
+            'n' => lit.push('\n'),
+            't' => lit.push('\t'),
+            'r' => lit.push('\r'),
+            'a' => lit.push('\x07'),
+            'f' => lit.push('\x0C'),
+            'v' => lit.push('\x0B'),
+            '\\' => lit.push('\\'),
+            '&' => lit.push('&'),
+            'x' | 'o' | 'd' => {
+                match parse_escape_value(next, &chars, &mut i).and_then(char::from_u32) {
+                    Some(ch) => lit.push(ch),
+                    None => lit.push(next),
+                }
+            }
+            _ => {
+                // Not a recognized escape; pass through
+                lit.push('\\');
+                lit.push(next);
+            }
+        }
+    }
+    flush(&mut lit, &mut parts);
+    parts
+}
+
 /// Apply a sed-style substitution. Returns the new string and whether any
 /// replacement was made.
 fn apply_substitution(
     regex: &Regex,
     text: &str,
-    replacement: &str,
+    replacement: &[ReplacePart],
     global: bool,
     nth: Option<usize>,
 ) -> (String, bool) {
@@ -793,71 +871,15 @@ fn apply_substitution(
     (result, made_substitution)
 }
 
-/// Interpret a sed-style replacement string against captures.
-///
-/// Handles:
-///   &        → whole match ($0)
-///   \1..\9   → numbered capture group
-///   \n \t \r → newline / tab / carriage return
-///   \a \f \v → BEL / form feed / vertical tab
-///   \xHH     → character with hex value HH
-///   \oNNN    → character with octal value NNN
-///   \dNNN    → character with decimal value NNN
-///   \\       → literal backslash
-///   \&       → literal &
-fn apply_sed_replacement(captures: &regex::Captures, replacement: &str, output: &mut String) {
-    let chars: Vec<char> = replacement.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '&' {
-            if let Some(m) = captures.get(0) {
-                output.push_str(m.as_str());
-            }
-            i += 1;
-            continue;
-        }
-        if c != '\\' {
-            output.push(c);
-            i += 1;
-            continue;
-        }
-        let Some(&next) = chars.get(i + 1) else {
-            output.push('\\');
-            break;
-        };
-        i += 2;
-        match next {
-            '0'..='9' => {
-                let group = (next as u8 - b'0') as usize;
-                if let Some(m) = captures.get(group) {
+/// Render a pre-compiled replacement against a match's captures.
+fn apply_sed_replacement(captures: &regex::Captures, parts: &[ReplacePart], output: &mut String) {
+    for part in parts {
+        match part {
+            ReplacePart::Literal(s) => output.push_str(s),
+            ReplacePart::Group(n) => {
+                if let Some(m) = captures.get(*n) {
                     output.push_str(m.as_str());
                 }
-            }
-            'n' => output.push('\n'),
-            't' => output.push('\t'),
-            'r' => output.push('\r'),
-            'a' => output.push('\x07'),
-            'f' => output.push('\x0C'),
-            'v' => output.push('\x0B'),
-            '\\' => output.push('\\'),
-            '&' => output.push('&'),
-            'x' => match parse_digits(&chars, &mut i, 16, 2).and_then(char::from_u32) {
-                Some(ch) => output.push(ch),
-                None => output.push('x'),
-            },
-            'o' => match parse_digits(&chars, &mut i, 8, 3).and_then(char::from_u32) {
-                Some(ch) => output.push(ch),
-                None => output.push('o'),
-            },
-            'd' => match parse_digits(&chars, &mut i, 10, 3).and_then(char::from_u32) {
-                Some(ch) => output.push(ch),
-                None => output.push('d'),
-            },
-            _ => {
-                // Not a recognized escape; pass through
-                output.push('\\');
-                output.push(next);
             }
         }
     }
@@ -1112,7 +1134,7 @@ fn compile_single_command(cmd: Command, extended: bool) -> Result<CompiledComman
                 .build()?;
             Ok(CompiledCommand::Substitute(CompiledSubstitute {
                 pattern: re,
-                replacement: sub.replacement,
+                replacement: compile_replacement(&sub.replacement),
                 global: sub.global,
                 print: sub.print,
                 nth: sub.nth,
@@ -1861,6 +1883,12 @@ mod tests {
     #[test]
     fn bre_dollar_literal_midpattern() {
         assert_eq!(run_sed(r"s/a$b/X/", "a$b\n"), "X\n");
+    }
+
+    #[test]
+    fn bracket_class_with_backslash() {
+        // GNU: `[\]` matches a literal backslash
+        assert_eq!(run_sed(r"s/[\]/X/", "a\\b\n"), "aXb\n");
     }
 
     #[test]

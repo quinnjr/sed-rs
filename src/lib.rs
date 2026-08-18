@@ -58,7 +58,6 @@ pub mod cli;
 pub mod command;
 pub mod engine;
 pub mod error;
-pub mod unescape;
 
 pub use cli::Options;
 pub use error::{Error, Result};
@@ -94,8 +93,12 @@ pub struct Sed {
 impl Sed {
     /// Create a new `Sed` instance from a sed script string.
     ///
-    /// The script is validated (parsed and regex-compiled) eagerly; an
-    /// error is returned immediately if the script is malformed.
+    /// The script is validated (parsed and regex-compiled) eagerly
+    /// against the default options; an error is returned immediately if
+    /// the script is malformed. Errors that depend on a later builder
+    /// change — e.g. a pattern that is only invalid under
+    /// [`extended_regexp`](Self::extended_regexp) — surface at `eval*`
+    /// time, which recompiles with the current options.
     pub fn new(script: &str) -> Result<Self> {
         // Validate the script eagerly
         let cmds = command::parse(script)?;
