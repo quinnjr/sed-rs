@@ -23,7 +23,7 @@ sed -n '/^ERROR/p' app.log                     # print only matching lines
 `sd` is a great modern find-and-replace tool, but it deliberately abandons `sed` syntax. `sed-rs` goes the other way — it keeps the `sed` language you already know and the scripts you already have, while giving you:
 
 - **No C, no system dependencies** — one self-contained Rust binary, `cargo install` and done.
-- **One consistent regex dialect.** Rust [`regex`](https://docs.rs/regex) (ERE/PCRE-style) everywhere — no BRE-vs-ERE mode confusion, no `\(`-to-group surprises.
+- **GNU regex semantics.** Basic regular expressions (BRE) by default, extended (ERE) with `-E`/`-r` — the same dialect switch as GNU `sed`, so existing one-liners work unmodified.
 - **A real library API.** The same engine that powers the CLI is exported as `sed_rs`, so you can run `sed` scripts from Rust without shelling out.
 
 ## Install
@@ -75,7 +75,7 @@ find . -name '*.txt' -print0 | sed -z 's/\n/ /g'
 | `-e SCRIPT`, `--expression=SCRIPT` | Add a script expression (repeatable) |
 | `-f FILE`, `--file=FILE` | Read script from a file (repeatable) |
 | `-i[SUFFIX]`, `--in-place[=SUFFIX]` | Edit files in place; with `SUFFIX`, keep a backup |
-| `-E`, `-r`, `--regexp-extended` | Accepted for compatibility — ERE is always on (no-op) |
+| `-E`, `-r`, `--regexp-extended` | Use extended regular expressions (default is BRE, as in GNU sed) |
 | `-s`, `--separate` | Treat input files as separate streams rather than one |
 | `-z`, `--null-data` | Use NUL (`\0`) as the line separator |
 
@@ -152,13 +152,12 @@ assert_eq!(out, b"new new new\n");
 
 ## Regex dialect & differences from GNU sed
 
-`sed-rs` always uses the Rust [`regex`](https://docs.rs/regex) crate (ERE/PCRE-flavored syntax). This is the main place behavior diverges from GNU `sed`:
+Like GNU `sed`, patterns default to POSIX *basic* regular expressions (BRE): `\(...\)` groups, `\{m,n\}` is an interval, and bare `( ) { } + ? |` are literals (with the GNU extensions `\+`, `\?`, `\|`). Passing `-E`/`-r` (or `Sed::extended_regexp(true)` in the library) switches to *extended* REs, where the bare metacharacters are active. GNU's `\xHH` (hex), `\oNNN` (octal), and `\dNNN` (decimal) character escapes are interpreted in both patterns and `s///` replacements.
 
-- **ERE is always on.** `-E`/`-r` are accepted but do nothing. Group with `( )` and alternate with `|` directly.
-- **No BRE constructs.** Backslash-grouping like `\(` `\)` and `\{` `\}` is *not* supported — use the bare metacharacters instead.
+Patterns are translated to Rust [`regex`](https://docs.rs/regex) syntax and matched by that engine, which is where the remaining divergences from GNU `sed` come from:
+
 - **No backreferences in patterns.** The Rust `regex` engine is finite-automaton based, so `\1`-style backreferences *within a match* aren't available. Backreferences in the *replacement* text — `\1`, `&` — work as usual.
-
-If a script relies on BRE-only behavior, port its patterns to ERE first. For the great majority of substitution, deletion, and addressing scripts, nothing changes.
+- **`\dNNN` needs digits.** A bare `\d` (no digits following) keeps the Rust regex meaning of "any digit" rather than being an error.
 
 ## Building & testing
 

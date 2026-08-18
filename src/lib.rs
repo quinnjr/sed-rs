@@ -53,11 +53,11 @@
 //! // engine.run(&[]) reads from stdin, engine.run(&[path]) reads files
 //! ```
 
+mod bre;
 pub mod cli;
 pub mod command;
 pub mod engine;
 pub mod error;
-pub mod unescape;
 
 pub use cli::Options;
 pub use error::{Error, Result};
@@ -93,8 +93,12 @@ pub struct Sed {
 impl Sed {
     /// Create a new `Sed` instance from a sed script string.
     ///
-    /// The script is validated (parsed and regex-compiled) eagerly; an
-    /// error is returned immediately if the script is malformed.
+    /// The script is validated (parsed and regex-compiled) eagerly
+    /// against the default options; an error is returned immediately if
+    /// the script is malformed. Errors that depend on a later builder
+    /// change — e.g. a pattern that is only invalid under
+    /// [`extended_regexp`](Self::extended_regexp) — surface at `eval*`
+    /// time, which recompiles with the current options.
     pub fn new(script: &str) -> Result<Self> {
         // Validate the script eagerly
         let cmds = command::parse(script)?;
@@ -121,6 +125,13 @@ impl Sed {
         self
     }
 
+    /// Use extended regular expressions (ERE) instead of the default
+    /// basic regular expressions (equivalent to `-E` / `-r`).
+    pub fn extended_regexp(&mut self, yes: bool) -> &mut Self {
+        self.options.extended_regexp = yes;
+        self
+    }
+
     /// Evaluate the script against the given input string and return
     /// the output as a `String`.
     pub fn eval(&self, input: &str) -> Result<String> {
@@ -140,11 +151,7 @@ impl Sed {
 
     /// Evaluate the script by reading from a [`std::io::Read`] source
     /// and writing to a [`std::io::Write`] sink.
-    pub fn eval_stream<R: io::Read, W: io::Write>(
-        &self,
-        reader: R,
-        writer: &mut W,
-    ) -> Result<()> {
+    pub fn eval_stream<R: io::Read, W: io::Write>(&self, reader: R, writer: &mut W) -> Result<()> {
         let commands = command::parse(&self.script)?;
         let engine = engine::Engine::new(commands, &self.options)?;
         let buf_reader = io::BufReader::new(reader);
@@ -203,6 +210,25 @@ mod tests {
     #[test]
     fn eval_bad_script() {
         assert!(eval("s/[invalid/x/", "test").is_err());
+    }
+
+    #[test]
+    fn eval_address_without_command_is_error() {
+        assert!(eval("123", "abc").is_err());
+        assert!(Sed::new("123").is_err());
+    }
+
+    #[test]
+    fn sed_builder_extended_regexp() {
+        // Default is BRE: '+' is literal
+        assert_eq!(eval("s/ab+/X/", "abbb\n").unwrap(), "abbb\n");
+        // ERE opt-in
+        let output = Sed::new("s/ab+/X/")
+            .unwrap()
+            .extended_regexp(true)
+            .eval("abbb\n")
+            .unwrap();
+        assert_eq!(output, "X\n");
     }
 
     #[test]

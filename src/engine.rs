@@ -14,6 +14,7 @@ use std::path::Path;
 
 use regex::Regex;
 
+use crate::bre::{parse_escape_value, translate_pattern};
 use crate::cli::Options;
 use crate::command::{Address, AddressRange, Command, SedCommand};
 use crate::error::{Error, Result};
@@ -51,7 +52,7 @@ impl CompiledAddressRange {
 
 struct CompiledSubstitute {
     pattern: Regex,
-    replacement: String,
+    replacement: Vec<ReplacePart>,
     global: bool,
     print: bool,
     nth: Option<usize>,
@@ -62,7 +63,10 @@ enum CompiledCommand {
     ScopeStart,
     ScopeEnd,
     Substitute(CompiledSubstitute),
-    Transliterate { from: Vec<char>, to: Vec<char> },
+    Transliterate {
+        from: Vec<char>,
+        to: Vec<char>,
+    },
     Print,
     PrintFirstLine,
     PrintLineNumber,
@@ -165,11 +169,8 @@ impl State {
 }
 
 impl Engine {
-    pub fn new(
-        parsed: Vec<SedCommand>,
-        options: &Options,
-    ) -> Result<Self> {
-        let (commands, labels) = compile_commands(parsed)?;
+    pub fn new(parsed: Vec<SedCommand>, options: &Options) -> Result<Self> {
+        let (commands, labels) = compile_commands(parsed, options.extended_regexp)?;
         Ok(Self {
             commands,
             labels,
@@ -180,11 +181,7 @@ impl Engine {
 
     /// Write a string followed by the appropriate line terminator
     /// (NUL in -z mode, newline otherwise).
-    fn write_line<W: Write>(
-        &self,
-        writer: &mut W,
-        s: &str,
-    ) -> Result<()> {
+    fn write_line<W: Write>(&self, writer: &mut W, s: &str) -> Result<()> {
         write!(writer, "{}", s)?;
         if self.null_data {
             writer.write_all(b"\0")?;
@@ -214,11 +211,7 @@ impl Engine {
                 }
                 let file = fs::File::open(path)?;
                 let reader = io::BufReader::new(file);
-                self.process_named(
-                    reader,
-                    &mut out,
-                    &path.display().to_string(),
-                )?;
+                self.process_named(reader, &mut out, &path.display().to_string())?;
             }
         }
 
@@ -227,11 +220,7 @@ impl Engine {
     }
 
     /// Process files in-place, optionally creating backups.
-    pub fn run_in_place(
-        &self,
-        files: &[std::path::PathBuf],
-        backup_suffix: &str,
-    ) -> Result<()> {
+    pub fn run_in_place(&self, files: &[std::path::PathBuf], backup_suffix: &str) -> Result<()> {
         for path in files {
             if !path.exists() {
                 eprintln!(
@@ -247,20 +236,12 @@ impl Engine {
             let mut output = Vec::new();
             {
                 let mut cursor = io::Cursor::new(&mut output);
-                self.process_named(
-                    reader,
-                    &mut cursor,
-                    &path.display().to_string(),
-                )?;
+                self.process_named(reader, &mut cursor, &path.display().to_string())?;
             }
 
             // Create backup if suffix is non-empty
             if !backup_suffix.is_empty() {
-                let backup_path = format!(
-                    "{}{}",
-                    path.display(),
-                    backup_suffix
-                );
+                let backup_path = format!("{}{}", path.display(), backup_suffix);
                 fs::copy(path, &backup_path)?;
             }
 
@@ -275,11 +256,7 @@ impl Engine {
     /// This is the core sed execution loop. It reads lines (or NUL-delimited
     /// records in `-z` mode), applies the compiled commands, and writes the
     /// results.
-    pub fn process_stream<R: BufRead, W: Write>(
-        &self,
-        reader: R,
-        writer: &mut W,
-    ) -> Result<()> {
+    pub fn process_stream<R: BufRead, W: Write>(&self, reader: R, writer: &mut W) -> Result<()> {
         self.process_named(reader, writer, "-")
     }
 
@@ -304,11 +281,7 @@ impl Engine {
             // Inner loop: allows `D` to re-run the script on the
             // remaining pattern space without reading a new input line.
             loop {
-                match self.execute_all(
-                    &mut state,
-                    &mut line_reader,
-                    writer,
-                )? {
+                match self.execute_all(&mut state, &mut line_reader, writer)? {
                     Flow::Restart => {
                         // `d` command: skip printing, flush appends,
                         // break to read next line
@@ -324,10 +297,7 @@ impl Engine {
                     Flow::Quit(code) => {
                         // Print pattern space then quit
                         if !self.quiet {
-                            self.write_line(
-                                writer,
-                                &state.pattern_space,
-                            )?;
+                            self.write_line(writer, &state.pattern_space)?;
                         }
                         self.flush_appends(&state, writer)?;
                         if code != 0 {
@@ -343,10 +313,7 @@ impl Engine {
                     }
                     Flow::Continue | Flow::Branch(_) => {
                         if !self.quiet {
-                            self.write_line(
-                                writer,
-                                &state.pattern_space,
-                            )?;
+                            self.write_line(writer, &state.pattern_space)?;
                         }
                         self.flush_appends(&state, writer)?;
                         break;
@@ -395,11 +362,7 @@ impl Engine {
             match &cmd.command {
                 CompiledCommand::ScopeStart => {
                     scope_depth += 1;
-                    if !self.address_matches(
-                        &cmd.address,
-                        state,
-                        pc,
-                    ) {
+                    if !self.address_matches(&cmd.address, state, pc) {
                         skip_depth = Some(scope_depth);
                     }
                     pc += 1;
@@ -420,21 +383,14 @@ impl Engine {
             }
 
             // Execute the command
-            let flow = self.execute_one(
-                &cmd.command,
-                state,
-                line_reader,
-                writer,
-            )?;
+            let flow = self.execute_one(&cmd.command, state, line_reader, writer)?;
 
             match flow {
                 Flow::Continue => {
                     pc += 1;
                 }
                 Flow::Restart => return Ok(Flow::Restart),
-                Flow::RestartScript => {
-                    return Ok(Flow::RestartScript)
-                }
+                Flow::RestartScript => return Ok(Flow::RestartScript),
                 Flow::Quit(c) => return Ok(Flow::Quit(c)),
                 Flow::QuitNoPrint(c) => return Ok(Flow::QuitNoPrint(c)),
                 Flow::Branch(ref label) => {
@@ -473,10 +429,7 @@ impl Engine {
                     state.pattern_space = result;
                     state.last_sub_success = true;
                     if sub.print {
-                        self.write_line(
-                            writer,
-                            &state.pattern_space,
-                        )?;
+                        self.write_line(writer, &state.pattern_space)?;
                     }
                     if let Some(ref path) = sub.write_file {
                         let mut f = fs::OpenOptions::new()
@@ -489,9 +442,7 @@ impl Engine {
             }
 
             CompiledCommand::Transliterate { from, to } => {
-                let mut new = String::with_capacity(
-                    state.pattern_space.len(),
-                );
+                let mut new = String::with_capacity(state.pattern_space.len());
                 for c in state.pattern_space.chars() {
                     if let Some(pos) = from.iter().position(|&f| f == c) {
                         new.push(to[pos]);
@@ -506,8 +457,7 @@ impl Engine {
 
             CompiledCommand::DeleteFirstLine => {
                 if let Some(pos) = state.pattern_space.find('\n') {
-                    state.pattern_space =
-                        state.pattern_space[pos + 1..].to_string();
+                    state.pattern_space = state.pattern_space[pos + 1..].to_string();
                     // Re-run the script on the remaining pattern space
                     // without reading a new input line
                     return Ok(Flow::RestartScript);
@@ -523,20 +473,14 @@ impl Engine {
 
             CompiledCommand::PrintFirstLine => {
                 if let Some(pos) = state.pattern_space.find('\n') {
-                    self.write_line(
-                        writer,
-                        &state.pattern_space[..pos],
-                    )?;
+                    self.write_line(writer, &state.pattern_space[..pos])?;
                 } else {
                     self.write_line(writer, &state.pattern_space)?;
                 }
             }
 
             CompiledCommand::PrintLineNumber => {
-                self.write_line(
-                    writer,
-                    &state.line_number.to_string(),
-                )?;
+                self.write_line(writer, &state.line_number.to_string())?;
             }
 
             CompiledCommand::List => {
@@ -573,10 +517,7 @@ impl Engine {
                 } else {
                     // Default: print and quit if no more input
                     if !self.quiet {
-                        self.write_line(
-                            writer,
-                            &state.pattern_space,
-                        )?;
+                        self.write_line(writer, &state.pattern_space)?;
                     }
                     return Ok(Flow::QuitNoPrint(0));
                 }
@@ -598,10 +539,7 @@ impl Engine {
                 state.pattern_space.push_str(&hold);
             }
             CompiledCommand::Exchange => {
-                std::mem::swap(
-                    &mut state.pattern_space,
-                    &mut state.hold_space,
-                );
+                std::mem::swap(&mut state.pattern_space, &mut state.hold_space);
             }
 
             CompiledCommand::Append(text) => {
@@ -662,14 +600,11 @@ impl Engine {
                 // is opened lazily and advanced on each invocation; when
                 // the file is exhausted the command does nothing.
                 let line = {
-                    let reader =
-                        state.r_readers.entry(path.clone()).or_insert_with(
-                            || {
-                                fs::File::open(path).ok().map(|f| {
-                                    io::BufReader::new(f).lines()
-                                })
-                            },
-                        );
+                    let reader = state.r_readers.entry(path.clone()).or_insert_with(|| {
+                        fs::File::open(path)
+                            .ok()
+                            .map(|f| io::BufReader::new(f).lines())
+                    });
                     reader
                         .as_mut()
                         .and_then(|lines| lines.next())
@@ -691,8 +626,7 @@ impl Engine {
                     .arg("-c")
                     .arg(&to_run)
                     .output()?;
-                let mut stdout =
-                    String::from_utf8_lossy(&output.stdout).into_owned();
+                let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 match cmd {
                     None => {
                         // `e` with no argument: replace the pattern space
@@ -737,32 +671,22 @@ impl Engine {
     ) -> bool {
         let raw = match &addr.kind {
             CompiledAddressKind::None => true,
-            CompiledAddressKind::Single(a) => {
-                addr_matches_line(a, state)
-            }
+            CompiledAddressKind::Single(a) => addr_matches_line(a, state),
             CompiledAddressKind::Range(start, end) => {
-                let active = state
-                    .range_active
-                    .get(cmd_index)
-                    .copied()
-                    .unwrap_or(false);
+                let active = state.range_active.get(cmd_index).copied().unwrap_or(false);
 
                 if active {
                     // We're in the range; check if end matches
                     if addr_matches_line(end, state) {
                         // End of range — still in range for this line
-                        if let Some(v) =
-                            state.range_active.get_mut(cmd_index)
-                        {
+                        if let Some(v) = state.range_active.get_mut(cmd_index) {
                             *v = false;
                         }
                     }
                     true
                 } else if addr_matches_line(start, state) {
                     // Start of range — activate it.
-                    if let Some(v) =
-                        state.range_active.get_mut(cmd_index)
-                    {
+                    if let Some(v) = state.range_active.get_mut(cmd_index) {
                         *v = true;
                     }
                     // Per POSIX/GNU: regex end addresses are NOT
@@ -771,9 +695,7 @@ impl Engine {
                     // current line close the range immediately (GNU
                     // extension: addr2 <= addr1 means one-line range).
                     if is_line_addr_at_or_before(end, state) {
-                        if let Some(v) =
-                            state.range_active.get_mut(cmd_index)
-                        {
+                        if let Some(v) = state.range_active.get_mut(cmd_index) {
                             *v = false;
                         }
                     }
@@ -787,11 +709,7 @@ impl Engine {
         if addr.negated { !raw } else { raw }
     }
 
-    fn flush_appends<W: Write>(
-        &self,
-        state: &State,
-        writer: &mut W,
-    ) -> Result<()> {
+    fn flush_appends<W: Write>(&self, state: &State, writer: &mut W) -> Result<()> {
         for text in &state.append_queue {
             self.write_line(writer, text)?;
         }
@@ -805,10 +723,7 @@ impl Engine {
 
 /// Check if the address is a line number at or before the current line.
 /// Used for immediate range closure when the end address is a line number.
-fn is_line_addr_at_or_before(
-    addr: &CompiledAddress,
-    state: &State,
-) -> bool {
+fn is_line_addr_at_or_before(addr: &CompiledAddress, state: &State) -> bool {
     match addr {
         CompiledAddress::Line(n) => *n <= state.line_number,
         _ => false,
@@ -826,8 +741,7 @@ fn addr_matches_line(addr: &CompiledAddress, state: &State) -> bool {
             } else if *first == 0 {
                 state.line_number % step == 0
             } else {
-                state.line_number >= *first
-                    && (state.line_number - first) % step == 0
+                state.line_number >= *first && (state.line_number - first) % step == 0
             }
         }
     }
@@ -837,12 +751,90 @@ fn addr_matches_line(addr: &CompiledAddress, state: &State) -> bool {
 // Substitution (inspired by sd's replacer)
 // ---------------------------------------------------------------------------
 
+/// One piece of a pre-compiled `s///` replacement: literal text (with
+/// escapes already decoded) or a capture-group reference (`&` is group 0).
+enum ReplacePart {
+    Literal(String),
+    Group(usize),
+}
+
+/// Pre-compile a sed-style replacement string into parts, decoding
+/// escapes once at script-compile time.
+///
+/// Handles:
+///   &        → whole match ($0)
+///   \1..\9   → numbered capture group
+///   \n \t \r → newline / tab / carriage return
+///   \a \f \v → BEL / form feed / vertical tab
+///   \xHH     → character with hex value HH
+///   \oNNN    → character with octal value NNN
+///   \dNNN    → character with decimal value NNN
+///   \\       → literal backslash
+///   \&       → literal &
+fn compile_replacement(replacement: &str) -> Vec<ReplacePart> {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let flush = |lit: &mut String, parts: &mut Vec<ReplacePart>| {
+        if !lit.is_empty() {
+            parts.push(ReplacePart::Literal(std::mem::take(lit)));
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '&' {
+            flush(&mut lit, &mut parts);
+            parts.push(ReplacePart::Group(0));
+            i += 1;
+            continue;
+        }
+        if c != '\\' {
+            lit.push(c);
+            i += 1;
+            continue;
+        }
+        let Some(&next) = chars.get(i + 1) else {
+            lit.push('\\');
+            break;
+        };
+        i += 2;
+        match next {
+            '0'..='9' => {
+                flush(&mut lit, &mut parts);
+                parts.push(ReplacePart::Group((next as u8 - b'0') as usize));
+            }
+            'n' => lit.push('\n'),
+            't' => lit.push('\t'),
+            'r' => lit.push('\r'),
+            'a' => lit.push('\x07'),
+            'f' => lit.push('\x0C'),
+            'v' => lit.push('\x0B'),
+            '\\' => lit.push('\\'),
+            '&' => lit.push('&'),
+            'x' | 'o' | 'd' => {
+                match parse_escape_value(next, &chars, &mut i).and_then(char::from_u32) {
+                    Some(ch) => lit.push(ch),
+                    None => lit.push(next),
+                }
+            }
+            _ => {
+                // Not a recognized escape; pass through
+                lit.push('\\');
+                lit.push(next);
+            }
+        }
+    }
+    flush(&mut lit, &mut parts);
+    parts
+}
+
 /// Apply a sed-style substitution. Returns the new string and whether any
 /// replacement was made.
 fn apply_substitution(
     regex: &Regex,
     text: &str,
-    replacement: &str,
+    replacement: &[ReplacePart],
     global: bool,
     nth: Option<usize>,
 ) -> (String, bool) {
@@ -879,64 +871,16 @@ fn apply_substitution(
     (result, made_substitution)
 }
 
-/// Interpret a sed-style replacement string against captures.
-///
-/// Handles:
-///   &       → whole match ($0)
-///   \1..\9  → numbered capture group
-///   \n      → newline
-///   \t      → tab
-///   \\      → literal backslash
-///   \&      → literal &
-fn apply_sed_replacement(
-    captures: &regex::Captures,
-    replacement: &str,
-    output: &mut String,
-) {
-    let mut chars = replacement.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    match next {
-                        '0'..='9' => {
-                            chars.next();
-                            let group = (next as u8 - b'0') as usize;
-                            if let Some(m) = captures.get(group) {
-                                output.push_str(m.as_str());
-                            }
-                        }
-                        'n' => {
-                            chars.next();
-                            output.push('\n');
-                        }
-                        't' => {
-                            chars.next();
-                            output.push('\t');
-                        }
-                        '\\' => {
-                            chars.next();
-                            output.push('\\');
-                        }
-                        '&' => {
-                            chars.next();
-                            output.push('&');
-                        }
-                        _ => {
-                            // Not a recognized escape; pass through
-                            output.push('\\');
-                        }
-                    }
-                } else {
-                    output.push('\\');
-                }
-            }
-            '&' => {
-                if let Some(m) = captures.get(0) {
+/// Render a pre-compiled replacement against a match's captures.
+fn apply_sed_replacement(captures: &regex::Captures, parts: &[ReplacePart], output: &mut String) {
+    for part in parts {
+        match part {
+            ReplacePart::Literal(s) => output.push_str(s),
+            ReplacePart::Group(n) => {
+                if let Some(m) = captures.get(*n) {
                     output.push_str(m.as_str());
                 }
             }
-            _ => output.push(c),
         }
     }
 }
@@ -1041,10 +985,7 @@ fn chomp(s: &str) -> String {
 }
 
 /// Read until NUL byte for -z/--null-data mode.
-fn read_until_null<R: BufRead>(
-    reader: &mut R,
-    buf: &mut String,
-) -> Option<String> {
+fn read_until_null<R: BufRead>(reader: &mut R, buf: &mut String) -> Option<String> {
     buf.clear();
     let mut byte_buf = Vec::new();
     match reader.read_until(b'\0', &mut byte_buf) {
@@ -1080,8 +1021,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, fchown};
-            let _ =
-                fchown(file, Some(metadata.uid()), Some(metadata.gid()));
+            let _ = fchown(file, Some(metadata.uid()), Some(metadata.gid()));
         }
     }
 
@@ -1100,10 +1040,11 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 fn compile_commands(
     parsed: Vec<SedCommand>,
+    extended: bool,
 ) -> Result<(Vec<CompiledSedCommand>, HashMap<String, usize>)> {
     let mut compiled = Vec::new();
     let mut labels = HashMap::new();
-    flatten_and_compile(parsed, &mut compiled, &mut labels)?;
+    flatten_and_compile(parsed, &mut compiled, &mut labels, extended)?;
     Ok((compiled, labels))
 }
 
@@ -1111,16 +1052,17 @@ fn flatten_and_compile(
     commands: Vec<SedCommand>,
     compiled: &mut Vec<CompiledSedCommand>,
     labels: &mut HashMap<String, usize>,
+    extended: bool,
 ) -> Result<()> {
     for cmd in commands {
         match cmd.command {
             Command::Block(block) => {
-                let addr = compile_address_range(cmd.address)?;
+                let addr = compile_address_range(cmd.address, extended)?;
                 compiled.push(CompiledSedCommand {
                     address: addr,
                     command: CompiledCommand::ScopeStart,
                 });
-                flatten_and_compile(block, compiled, labels)?;
+                flatten_and_compile(block, compiled, labels, extended)?;
                 compiled.push(CompiledSedCommand {
                     address: CompiledAddressRange::none(),
                     command: CompiledCommand::ScopeEnd,
@@ -1134,8 +1076,8 @@ fn flatten_and_compile(
                 });
             }
             other => {
-                let addr = compile_address_range(cmd.address)?;
-                let cc = compile_single_command(other)?;
+                let addr = compile_address_range(cmd.address, extended)?;
+                let cc = compile_single_command(other, extended)?;
                 compiled.push(CompiledSedCommand {
                     address: addr,
                     command: cc,
@@ -1146,76 +1088,66 @@ fn flatten_and_compile(
     Ok(())
 }
 
-fn compile_address_range(
-    range: AddressRange,
-) -> Result<CompiledAddressRange> {
+fn compile_address_range(range: AddressRange, extended: bool) -> Result<CompiledAddressRange> {
     match range {
         AddressRange::None => Ok(CompiledAddressRange::none()),
-        AddressRange::Single { addr, negated } => {
-            Ok(CompiledAddressRange {
-                kind: CompiledAddressKind::Single(
-                    compile_address(addr)?,
-                ),
-                negated,
-            })
-        }
+        AddressRange::Single { addr, negated } => Ok(CompiledAddressRange {
+            kind: CompiledAddressKind::Single(compile_address(addr, extended)?),
+            negated,
+        }),
         AddressRange::Range {
             start,
             end,
             negated,
         } => Ok(CompiledAddressRange {
             kind: CompiledAddressKind::Range(
-                compile_address(start)?,
-                compile_address(end)?,
+                compile_address(start, extended)?,
+                compile_address(end, extended)?,
             ),
             negated,
         }),
     }
 }
 
-fn compile_address(addr: Address) -> Result<CompiledAddress> {
+fn compile_address(addr: Address, extended: bool) -> Result<CompiledAddress> {
     match addr {
         Address::Line(n) => Ok(CompiledAddress::Line(n)),
         Address::Last => Ok(CompiledAddress::Last),
         Address::Regex(pattern) => {
-            let re = regex::RegexBuilder::new(&pattern)
+            let translated = translate_pattern(&pattern, extended);
+            let re = regex::RegexBuilder::new(&translated)
                 .multi_line(true)
                 .build()?;
             Ok(CompiledAddress::Regex(re))
         }
-        Address::Step { first, step } => {
-            Ok(CompiledAddress::Step { first, step })
-        }
+        Address::Step { first, step } => Ok(CompiledAddress::Step { first, step }),
     }
 }
 
-fn compile_single_command(cmd: Command) -> Result<CompiledCommand> {
+fn compile_single_command(cmd: Command, extended: bool) -> Result<CompiledCommand> {
     match cmd {
         Command::Substitute(sub) => {
-            let re = regex::RegexBuilder::new(&sub.pattern)
+            let translated = translate_pattern(&sub.pattern, extended);
+            let re = regex::RegexBuilder::new(&translated)
                 .case_insensitive(sub.case_insensitive)
                 .multi_line(true)
                 .build()?;
             Ok(CompiledCommand::Substitute(CompiledSubstitute {
                 pattern: re,
-                replacement: sub.replacement,
+                replacement: compile_replacement(&sub.replacement),
                 global: sub.global,
                 print: sub.print,
                 nth: sub.nth,
                 write_file: sub.write_file,
             }))
         }
-        Command::Transliterate { from, to } => {
-            Ok(CompiledCommand::Transliterate { from, to })
-        }
+        Command::Transliterate { from, to } => Ok(CompiledCommand::Transliterate { from, to }),
         Command::Print => Ok(CompiledCommand::Print),
         Command::PrintFirstLine => Ok(CompiledCommand::PrintFirstLine),
         Command::PrintLineNumber => Ok(CompiledCommand::PrintLineNumber),
         Command::List => Ok(CompiledCommand::List),
         Command::Delete => Ok(CompiledCommand::Delete),
-        Command::DeleteFirstLine => {
-            Ok(CompiledCommand::DeleteFirstLine)
-        }
+        Command::DeleteFirstLine => Ok(CompiledCommand::DeleteFirstLine),
         Command::Next => Ok(CompiledCommand::Next),
         Command::NextAppend => Ok(CompiledCommand::NextAppend),
         Command::HoldReplace => Ok(CompiledCommand::HoldReplace),
@@ -1228,15 +1160,11 @@ fn compile_single_command(cmd: Command) -> Result<CompiledCommand> {
         Command::Change(t) => Ok(CompiledCommand::Change(t)),
         Command::Branch(l) => Ok(CompiledCommand::Branch(l)),
         Command::BranchIfSub(l) => Ok(CompiledCommand::BranchIfSub(l)),
-        Command::BranchIfNotSub(l) => {
-            Ok(CompiledCommand::BranchIfNotSub(l))
-        }
+        Command::BranchIfNotSub(l) => Ok(CompiledCommand::BranchIfNotSub(l)),
         Command::ReadFile(f) => Ok(CompiledCommand::ReadFile(f)),
         Command::ReadLine(f) => Ok(CompiledCommand::ReadLine(f)),
         Command::WriteFile(f) => Ok(CompiledCommand::WriteFile(f)),
-        Command::WriteFirstLine(f) => {
-            Ok(CompiledCommand::WriteFirstLine(f))
-        }
+        Command::WriteFirstLine(f) => Ok(CompiledCommand::WriteFirstLine(f)),
         Command::PrintFileName => Ok(CompiledCommand::PrintFileName),
         Command::Execute(c) => Ok(CompiledCommand::Execute(c)),
         Command::Quit(c) => Ok(CompiledCommand::Quit(c)),
@@ -1346,10 +1274,7 @@ mod tests {
 
     #[test]
     fn substitute_global() {
-        assert_eq!(
-            run_sed("s/o/0/g", "foo boo\n"),
-            "f00 b00\n"
-        );
+        assert_eq!(run_sed("s/o/0/g", "foo boo\n"), "f00 b00\n");
     }
 
     #[test]
@@ -1364,18 +1289,12 @@ mod tests {
 
     #[test]
     fn substitute_ampersand() {
-        assert_eq!(
-            run_sed("s/foo/[&]/", "foo\n"),
-            "[foo]\n"
-        );
+        assert_eq!(run_sed("s/foo/[&]/", "foo\n"), "[foo]\n");
     }
 
     #[test]
     fn substitute_backreference() {
-        assert_eq!(
-            run_sed("s/(f)(o+)/\\2\\1/", "foo\n"),
-            "oof\n"
-        );
+        assert_eq!(run_sed(r"s/\(f\)\(o\+\)/\2\1/", "foo\n"), "oof\n");
     }
 
     #[test]
@@ -1385,10 +1304,7 @@ mod tests {
 
     #[test]
     fn print_command_quiet() {
-        assert_eq!(
-            run_sed_opts("2p", "a\nb\nc\n", true),
-            "b\n"
-        );
+        assert_eq!(run_sed_opts("2p", "a\nb\nc\n", true), "b\n");
     }
 
     #[test]
@@ -1401,26 +1317,17 @@ mod tests {
 
     #[test]
     fn address_range() {
-        assert_eq!(
-            run_sed("2,3d", "a\nb\nc\nd\n"),
-            "a\nd\n"
-        );
+        assert_eq!(run_sed("2,3d", "a\nb\nc\nd\n"), "a\nd\n");
     }
 
     #[test]
     fn address_negation() {
-        assert_eq!(
-            run_sed("2!d", "a\nb\nc\n"),
-            "b\n"
-        );
+        assert_eq!(run_sed("2!d", "a\nb\nc\n"), "b\n");
     }
 
     #[test]
     fn transliterate() {
-        assert_eq!(
-            run_sed("y/abc/xyz/", "abc\n"),
-            "xyz\n"
-        );
+        assert_eq!(run_sed("y/abc/xyz/", "abc\n"), "xyz\n");
     }
 
     #[test]
@@ -1439,19 +1346,13 @@ mod tests {
 
     #[test]
     fn exchange() {
-        assert_eq!(
-            run_sed("1{h;d};2{x}", "first\nsecond\n"),
-            "first\n"
-        );
+        assert_eq!(run_sed("1{h;d};2{x}", "first\nsecond\n"), "first\n");
     }
 
     #[test]
     fn labels_and_branch() {
         // Simple loop: replace one 'a' at a time with 'b', branch back if substitution made
-        assert_eq!(
-            run_sed(":l\ns/a/b/\nt l", "aaa\n"),
-            "bbb\n"
-        );
+        assert_eq!(run_sed(":l\ns/a/b/\nt l", "aaa\n"), "bbb\n");
     }
 
     #[test]
@@ -1472,26 +1373,17 @@ mod tests {
 
     #[test]
     fn line_number() {
-        assert_eq!(
-            run_sed("=", "a\nb\n"),
-            "1\na\n2\nb\n"
-        );
+        assert_eq!(run_sed("=", "a\nb\n"), "1\na\n2\nb\n");
     }
 
     #[test]
     fn multiple_commands() {
-        assert_eq!(
-            run_sed("s/a/x/; s/b/y/", "ab\n"),
-            "xy\n"
-        );
+        assert_eq!(run_sed("s/a/x/; s/b/y/", "ab\n"), "xy\n");
     }
 
     #[test]
     fn last_line_address() {
-        assert_eq!(
-            run_sed("$d", "a\nb\nc\n"),
-            "a\nb\n"
-        );
+        assert_eq!(run_sed("$d", "a\nb\nc\n"), "a\nb\n");
     }
 
     #[test]
@@ -1501,34 +1393,22 @@ mod tests {
 
     #[test]
     fn custom_delimiter() {
-        assert_eq!(
-            run_sed("s|foo|bar|", "foo\n"),
-            "bar\n"
-        );
+        assert_eq!(run_sed("s|foo|bar|", "foo\n"), "bar\n");
     }
 
     #[test]
     fn case_insensitive_sub() {
-        assert_eq!(
-            run_sed("s/foo/bar/i", "FOO\n"),
-            "bar\n"
-        );
+        assert_eq!(run_sed("s/foo/bar/i", "FOO\n"), "bar\n");
     }
 
     #[test]
     fn block_with_address() {
-        assert_eq!(
-            run_sed("/a/ { s/a/x/; s/$/!/ }", "a\nb\n"),
-            "x!\nb\n"
-        );
+        assert_eq!(run_sed("/a/ { s/a/x/; s/$/!/ }", "a\nb\n"), "x!\nb\n");
     }
 
     #[test]
     fn regex_range_address() {
-        assert_eq!(
-            run_sed("/start/,/end/d", "a\nstart\nb\nend\nc\n"),
-            "a\nc\n"
-        );
+        assert_eq!(run_sed("/start/,/end/d", "a\nstart\nb\nend\nc\n"), "a\nc\n");
     }
 
     #[test]
@@ -1538,10 +1418,7 @@ mod tests {
 
     #[test]
     fn passthrough_no_match() {
-        assert_eq!(
-            run_sed("s/xyz/abc/", "hello\n"),
-            "hello\n"
-        );
+        assert_eq!(run_sed("s/xyz/abc/", "hello\n"), "hello\n");
     }
 
     // ---------------------------------------------------------------
@@ -1565,19 +1442,13 @@ mod tests {
     #[test]
     fn n_with_command_after() {
         // n reads next line, then subsequent commands operate on it
-        assert_eq!(
-            run_sed("n;s/b/X/", "a\nb\nc\n"),
-            "a\nX\nc\n"
-        );
+        assert_eq!(run_sed("n;s/b/X/", "a\nb\nc\n"), "a\nX\nc\n");
     }
 
     #[test]
     fn n_quiet_mode() {
         // With -n, n does NOT print before reading next
-        assert_eq!(
-            run_sed_opts("n;p", "a\nb\nc\n", true),
-            "b\n"
-        );
+        assert_eq!(run_sed_opts("n;p", "a\nb\nc\n", true), "b\n");
     }
 
     // -- N command --
@@ -1585,19 +1456,13 @@ mod tests {
     #[test]
     fn big_n_appends() {
         // N appends next line to pattern space with \n
-        assert_eq!(
-            run_sed("N;s/\\n/ /", "a\nb\n"),
-            "a b\n"
-        );
+        assert_eq!(run_sed("N;s/\\n/ /", "a\nb\n"), "a b\n");
     }
 
     #[test]
     fn big_n_at_end() {
         // N at last line: print and exit
-        assert_eq!(
-            run_sed("N", "a\nb\nc\n"),
-            "a\nb\nc\n"
-        );
+        assert_eq!(run_sed("N", "a\nb\nc\n"), "a\nb\nc\n");
     }
 
     // -- D command --
@@ -1605,10 +1470,7 @@ mod tests {
     #[test]
     fn big_d_deletes_first_line_of_pattern() {
         // N;P;D is the classic "sliding window" idiom
-        assert_eq!(
-            run_sed("N;P;D", "a\nb\nc\n"),
-            "a\nb\nc\n"
-        );
+        assert_eq!(run_sed("N;P;D", "a\nb\nc\n"), "a\nb\nc\n");
     }
 
     #[test]
@@ -1621,18 +1483,12 @@ mod tests {
 
     #[test]
     fn change_single_address() {
-        assert_eq!(
-            run_sed("2c REPLACED", "a\nb\nc\n"),
-            "a\nREPLACED\nc\n"
-        );
+        assert_eq!(run_sed("2c REPLACED", "a\nb\nc\n"), "a\nREPLACED\nc\n");
     }
 
     #[test]
     fn change_regex_address() {
-        assert_eq!(
-            run_sed("/b/c GONE", "a\nb\nc\n"),
-            "a\nGONE\nc\n"
-        );
+        assert_eq!(run_sed("/b/c GONE", "a\nb\nc\n"), "a\nGONE\nc\n");
     }
 
     // -- P command --
@@ -1640,30 +1496,21 @@ mod tests {
     #[test]
     fn big_p_first_line() {
         // P prints up to first \n in pattern space
-        assert_eq!(
-            run_sed("N;P", "first\nsecond\n"),
-            "first\nfirst\nsecond\n"
-        );
+        assert_eq!(run_sed("N;P", "first\nsecond\n"), "first\nfirst\nsecond\n");
     }
 
     // -- i (insert) with address --
 
     #[test]
     fn insert_before_last() {
-        assert_eq!(
-            run_sed("$i END", "a\nb\n"),
-            "a\nEND\nb\n"
-        );
+        assert_eq!(run_sed("$i END", "a\nb\n"), "a\nEND\nb\n");
     }
 
     // -- a (append) with regex address --
 
     #[test]
     fn append_after_match() {
-        assert_eq!(
-            run_sed("/b/a AFTER", "a\nb\nc\n"),
-            "a\nb\nAFTER\nc\n"
-        );
+        assert_eq!(run_sed("/b/a AFTER", "a\nb\nc\n"), "a\nb\nAFTER\nc\n");
     }
 
     // -- Hold space operations --
@@ -1680,19 +1527,13 @@ mod tests {
     #[test]
     fn hold_get_replace() {
         // h copies to hold; g copies from hold to pattern
-        assert_eq!(
-            run_sed("1h;2g", "first\nsecond\n"),
-            "first\nfirst\n"
-        );
+        assert_eq!(run_sed("1h;2g", "first\nsecond\n"), "first\nfirst\n");
     }
 
     #[test]
     fn reverse_lines() {
         // Classic sed reverse: 1!G;h;$!d
-        assert_eq!(
-            run_sed("1!G;h;$!d", "a\nb\nc\n"),
-            "c\nb\na\n"
-        );
+        assert_eq!(run_sed("1!G;h;$!d", "a\nb\nc\n"), "c\nb\na\n");
     }
 
     // -- x (exchange) --
@@ -1700,46 +1541,31 @@ mod tests {
     #[test]
     fn exchange_basic() {
         // Hold starts empty, so x on line 1 gives empty, hold gets "a"
-        assert_eq!(
-            run_sed("x", "a\nb\n"),
-            "\na\n"
-        );
+        assert_eq!(run_sed("x", "a\nb\n"), "\na\n");
     }
 
     // -- Address ranges --
 
     #[test]
     fn range_regex_to_regex() {
-        assert_eq!(
-            run_sed("/start/,/end/d", "a\nstart\nb\nend\nc\n"),
-            "a\nc\n"
-        );
+        assert_eq!(run_sed("/start/,/end/d", "a\nstart\nb\nend\nc\n"), "a\nc\n");
     }
 
     #[test]
     fn range_line_to_last() {
-        assert_eq!(
-            run_sed("2,$d", "a\nb\nc\nd\n"),
-            "a\n"
-        );
+        assert_eq!(run_sed("2,$d", "a\nb\nc\nd\n"), "a\n");
     }
 
     #[test]
     fn range_negated() {
         // Delete everything NOT in range 2,3
-        assert_eq!(
-            run_sed("2,3!d", "a\nb\nc\nd\n"),
-            "b\nc\n"
-        );
+        assert_eq!(run_sed("2,3!d", "a\nb\nc\nd\n"), "b\nc\n");
     }
 
     #[test]
     fn range_start_equals_end_on_same_line() {
         // 2,2d only deletes line 2
-        assert_eq!(
-            run_sed("2,2d", "a\nb\nc\n"),
-            "a\nc\n"
-        );
+        assert_eq!(run_sed("2,2d", "a\nb\nc\n"), "a\nc\n");
     }
 
     #[test]
@@ -1747,11 +1573,7 @@ mod tests {
         // When start and end regexes could match same line,
         // end is NOT checked on start line (POSIX/GNU behavior)
         assert_eq!(
-            run_sed_opts(
-                "/\\[start\\]/,/\\[/p",
-                "[start]\nfoo\nbar\n[end]\n",
-                true,
-            ),
+            run_sed_opts("/\\[start\\]/,/\\[/p", "[start]\nfoo\nbar\n[end]\n", true,),
             "[start]\nfoo\nbar\n[end]\n"
         );
     }
@@ -1760,18 +1582,12 @@ mod tests {
 
     #[test]
     fn step_even_lines() {
-        assert_eq!(
-            run_sed("0~2d", "a\nb\nc\nd\ne\n"),
-            "a\nc\ne\n"
-        );
+        assert_eq!(run_sed("0~2d", "a\nb\nc\nd\ne\n"), "a\nc\ne\n");
     }
 
     #[test]
     fn step_odd_lines() {
-        assert_eq!(
-            run_sed("1~2d", "a\nb\nc\nd\ne\n"),
-            "b\nd\n"
-        );
+        assert_eq!(run_sed("1~2d", "a\nb\nc\nd\ne\n"), "b\nd\n");
     }
 
     // -- Substitute flags --
@@ -1789,53 +1605,35 @@ mod tests {
 
     #[test]
     fn sub_global_and_print() {
-        assert_eq!(
-            run_sed_opts("s/a/X/gp", "aaa\nbbb\n", true),
-            "XXX\n"
-        );
+        assert_eq!(run_sed_opts("s/a/X/gp", "aaa\nbbb\n", true), "XXX\n");
     }
 
     #[test]
     fn sub_escaped_delimiter() {
         // Use | as delimiter, pattern contains |
-        assert_eq!(
-            run_sed("s/a\\/b/X/", "a/b\n"),
-            "X\n"
-        );
+        assert_eq!(run_sed("s/a\\/b/X/", "a/b\n"), "X\n");
     }
 
     #[test]
     fn sub_newline_in_replacement() {
-        assert_eq!(
-            run_sed("s/a/X\\nY/", "a\n"),
-            "X\nY\n"
-        );
+        assert_eq!(run_sed("s/a/X\\nY/", "a\n"), "X\nY\n");
     }
 
     #[test]
     fn sub_tab_in_replacement() {
-        assert_eq!(
-            run_sed("s/a/X\\tY/", "a\n"),
-            "X\tY\n"
-        );
+        assert_eq!(run_sed("s/a/X\\tY/", "a\n"), "X\tY\n");
     }
 
     #[test]
     fn sub_literal_ampersand() {
         // \& should be literal &
-        assert_eq!(
-            run_sed("s/foo/\\&/", "foo\n"),
-            "&\n"
-        );
+        assert_eq!(run_sed("s/foo/\\&/", "foo\n"), "&\n");
     }
 
     #[test]
     fn sub_literal_backslash() {
         // \\\\ in replacement → literal backslash
-        assert_eq!(
-            run_sed("s/a/\\\\/", "a\n"),
-            "\\\n"
-        );
+        assert_eq!(run_sed("s/a/\\\\/", "a\n"), "\\\n");
     }
 
     // -- Branching --
@@ -1843,28 +1641,19 @@ mod tests {
     #[test]
     fn branch_unconditional() {
         // b skip jumps forward past the d command, preserving output
-        assert_eq!(
-            run_sed("b skip;d;:skip", "hello\n"),
-            "hello\n"
-        );
+        assert_eq!(run_sed("b skip;d;:skip", "hello\n"), "hello\n");
     }
 
     #[test]
     fn branch_unconditional_no_label() {
         // b (no label) branches to end of script
-        assert_eq!(
-            run_sed("b\nd", "hello\n"),
-            "hello\n"
-        );
+        assert_eq!(run_sed("b\nd", "hello\n"), "hello\n");
     }
 
     #[test]
     fn branch_if_sub_no_match() {
         // t should NOT branch if no sub was made
-        assert_eq!(
-            run_sed("s/x/y/;t end;s/a/X/;:end", "abc\n"),
-            "Xbc\n"
-        );
+        assert_eq!(run_sed("s/x/y/;t end;s/a/X/;:end", "abc\n"), "Xbc\n");
     }
 
     #[test]
@@ -1880,20 +1669,14 @@ mod tests {
 
     #[test]
     fn list_command() {
-        assert_eq!(
-            run_sed("l", "a\tb\n"),
-            "a\\tb$\na\tb\n"
-        );
+        assert_eq!(run_sed("l", "a\tb\n"), "a\\tb$\na\tb\n");
     }
 
     // -- = command (line number) with address --
 
     #[test]
     fn line_number_with_address() {
-        assert_eq!(
-            run_sed("2=", "a\nb\nc\n"),
-            "a\n2\nb\nc\n"
-        );
+        assert_eq!(run_sed("2=", "a\nb\nc\n"), "a\n2\nb\nc\n");
     }
 
     // -- z (clear pattern) --
@@ -1910,10 +1693,7 @@ mod tests {
 
     #[test]
     fn strip_html_tags() {
-        assert_eq!(
-            run_sed("s/<[^>]*>//g", "<b>bold</b>\n"),
-            "bold\n"
-        );
+        assert_eq!(run_sed("s/<[^>]*>//g", "<b>bold</b>\n"), "bold\n");
     }
 
     #[test]
@@ -1928,35 +1708,23 @@ mod tests {
     #[test]
     fn double_space() {
         // Classic double-spacing: G appends empty hold to pattern
-        assert_eq!(
-            run_sed("G", "a\nb\n"),
-            "a\n\nb\n\n"
-        );
+        assert_eq!(run_sed("G", "a\nb\n"), "a\n\nb\n\n");
     }
 
     #[test]
     fn delete_empty_lines() {
-        assert_eq!(
-            run_sed("/^$/d", "a\n\nb\n\nc\n"),
-            "a\nb\nc\n"
-        );
+        assert_eq!(run_sed("/^$/d", "a\n\nb\n\nc\n"), "a\nb\nc\n");
     }
 
     #[test]
     fn multiple_expressions() {
         // Simulates -e 'cmd1' -e 'cmd2' by joining with newline
-        assert_eq!(
-            run_sed("s/a/x/\ns/b/y/", "ab\n"),
-            "xy\n"
-        );
+        assert_eq!(run_sed("s/a/x/\ns/b/y/", "ab\n"), "xy\n");
     }
 
     #[test]
     fn nested_blocks() {
-        assert_eq!(
-            run_sed("1{/a/{s/a/X/}}", "abc\ndef\n"),
-            "Xbc\ndef\n"
-        );
+        assert_eq!(run_sed("1{/a/{s/a/X/}}", "abc\ndef\n"), "Xbc\ndef\n");
     }
 
     // -- Edge cases --
@@ -1987,30 +1755,18 @@ mod tests {
     fn multiple_ranges_interleaved() {
         // Two separate range commands
         let input = "a\nb\nc\nd\ne\nf\n";
-        assert_eq!(
-            run_sed("2,3s/./X/;5,6s/./Y/", input),
-            "a\nX\nX\nd\nY\nY\n"
-        );
+        assert_eq!(run_sed("2,3s/./X/;5,6s/./Y/", input), "a\nX\nX\nd\nY\nY\n");
     }
 
     #[test]
     fn regex_special_chars() {
-        assert_eq!(
-            run_sed("s/\\./X/g", "a.b.c\n"),
-            "aXbXc\n"
-        );
+        assert_eq!(run_sed("s/\\./X/g", "a.b.c\n"), "aXbXc\n");
     }
 
     #[test]
     fn regex_anchors() {
-        assert_eq!(
-            run_sed("s/^/> /", "hello\n"),
-            "> hello\n"
-        );
-        assert_eq!(
-            run_sed("s/$/ </", "hello\n"),
-            "hello <\n"
-        );
+        assert_eq!(run_sed("s/^/> /", "hello\n"), "> hello\n");
+        assert_eq!(run_sed("s/$/ </", "hello\n"), "hello <\n");
     }
 
     // -- q and Q --
@@ -2040,10 +1796,7 @@ mod tests {
     #[test]
     fn number_lines() {
         // Print line number then line (like nl)
-        assert_eq!(
-            run_sed("=;s/^/  /", "a\nb\n"),
-            "1\n  a\n2\n  b\n"
-        );
+        assert_eq!(run_sed("=;s/^/  /", "a\nb\n"), "1\n  a\n2\n  b\n");
     }
 
     #[test]
@@ -2057,10 +1810,7 @@ mod tests {
 
     #[test]
     fn delete_first_and_last() {
-        assert_eq!(
-            run_sed("1d;$d", "a\nb\nc\n"),
-            "b\n"
-        );
+        assert_eq!(run_sed("1d;$d", "a\nb\nc\n"), "b\n");
     }
 
     #[test]
@@ -2069,5 +1819,131 @@ mod tests {
             run_sed("/old/c new", "old\nkeep\nold\n"),
             "new\nkeep\nnew\n"
         );
+    }
+
+    fn run_sed_ere(script: &str, input: &str) -> String {
+        let parsed = command::parse(script).unwrap();
+        let options = Options {
+            extended_regexp: true,
+            ..Options::default()
+        };
+        let engine = Engine::new(parsed, &options).unwrap();
+        let reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        engine.process_stream(reader, &mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    // -- BRE mode (default, GNU-compatible) --
+
+    #[test]
+    fn bre_group_and_backreference() {
+        assert_eq!(run_sed(r"s/\(a\)/[\1]/", "abc\n"), "[a]bc\n");
+    }
+
+    #[test]
+    fn bre_plus_is_literal() {
+        assert_eq!(run_sed(r"s/ab+/X/", "abbb\n"), "abbb\n");
+        assert_eq!(run_sed(r"s/ab+/X/", "ab+c\n"), "Xc\n");
+    }
+
+    #[test]
+    fn bre_escaped_plus_is_repetition() {
+        assert_eq!(run_sed(r"s/ab\+/X/", "abbb\n"), "X\n");
+    }
+
+    #[test]
+    fn bre_question_is_literal() {
+        assert_eq!(run_sed(r"s/ab?/X/", "ab?c\n"), "Xc\n");
+        assert_eq!(run_sed(r"s/ab\?c/X/", "ac\n"), "X\n");
+    }
+
+    #[test]
+    fn bre_alternation_needs_backslash() {
+        assert_eq!(run_sed(r"s/a\|b/X/g", "ab\n"), "XX\n");
+        assert_eq!(run_sed(r"s/a|b/X/", "a|b\n"), "X\n");
+    }
+
+    #[test]
+    fn bre_interval_needs_backslash() {
+        assert_eq!(run_sed(r"s/ab\{2\}/X/", "abb\n"), "X\n");
+        assert_eq!(run_sed(r"s/a{2}/X/", "a{2}\n"), "X\n");
+    }
+
+    #[test]
+    fn bre_parens_are_literal() {
+        assert_eq!(run_sed(r"s/(a)/X/", "(a)\n"), "X\n");
+    }
+
+    #[test]
+    fn bre_caret_literal_midpattern() {
+        assert_eq!(run_sed(r"s/a^b/X/", "a^b\n"), "X\n");
+    }
+
+    #[test]
+    fn bre_dollar_literal_midpattern() {
+        assert_eq!(run_sed(r"s/a$b/X/", "a$b\n"), "X\n");
+    }
+
+    #[test]
+    fn bracket_class_with_backslash() {
+        // GNU: `[\]` matches a literal backslash
+        assert_eq!(run_sed(r"s/[\]/X/", "a\\b\n"), "aXb\n");
+    }
+
+    #[test]
+    fn bre_address_pattern() {
+        assert_eq!(run_sed(r"/ab\+/d", "abbb\nxyz\n"), "xyz\n");
+        assert_eq!(run_sed(r"/\(ab\)c/d", "abc\nxyz\n"), "xyz\n");
+    }
+
+    // -- ERE mode (-E) --
+
+    #[test]
+    fn ere_group_and_plus() {
+        assert_eq!(run_sed_ere("s/(f)(o+)/\\2\\1/", "foo\n"), "oof\n");
+    }
+
+    #[test]
+    fn ere_alternation() {
+        assert_eq!(run_sed_ere("s/a|b/X/g", "ab\n"), "XX\n");
+    }
+
+    // -- \xHH, \oNNN, \dNNN escapes (GNU) --
+
+    #[test]
+    fn replacement_hex_escape() {
+        assert_eq!(run_sed("N; s/\\n/\\x02/g", "a\nb\n"), "a\x02b\n");
+    }
+
+    #[test]
+    fn replacement_octal_escape() {
+        assert_eq!(run_sed("N; s/\\n/\\o002/g", "a\nb\n"), "a\x02b\n");
+    }
+
+    #[test]
+    fn replacement_decimal_escape() {
+        assert_eq!(run_sed("N; s/\\n/\\d002/g", "a\nb\n"), "a\x02b\n");
+    }
+
+    #[test]
+    fn replacement_hex_ampersand_is_literal() {
+        // \x26 is '&' but must not expand to the whole match
+        assert_eq!(run_sed(r"s/ab/\x26/", "ab\n"), "&\n");
+    }
+
+    #[test]
+    fn pattern_hex_escape() {
+        assert_eq!(run_sed(r"s/\x41/Z/", "A\n"), "Z\n");
+    }
+
+    #[test]
+    fn pattern_octal_escape() {
+        assert_eq!(run_sed(r"s/\o101/Z/", "A\n"), "Z\n");
+    }
+
+    #[test]
+    fn pattern_decimal_escape() {
+        assert_eq!(run_sed(r"s/\d065/Z/", "A\n"), "Z\n");
     }
 }
