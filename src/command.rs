@@ -45,7 +45,10 @@ pub struct SubstituteCmd {
 pub enum Command {
     // -- Substitution & Transliteration --
     Substitute(SubstituteCmd),
-    Transliterate { from: Vec<char>, to: Vec<char> },
+    Transliterate {
+        from: Vec<char>,
+        to: Vec<char>,
+    },
 
     // -- Output --
     Print,
@@ -210,8 +213,12 @@ impl Parser {
         // Parse address range
         let address = self.parse_address_range()?;
         self.skip_spaces();
+        let has_address = !matches!(address, AddressRange::None);
 
         let Some(ch) = self.advance() else {
+            if has_address {
+                return Err(Error::Parse("missing command".into()));
+            }
             return Ok(None);
         };
 
@@ -220,7 +227,14 @@ impl Parser {
                 let block = self.parse_block()?;
                 Command::Block(block)
             }
-            '}' => return Ok(None), // handled by parse_block
+            '}' => {
+                // Closing brace is handled by parse_block; an address
+                // directly before '}' means its command is missing.
+                if has_address {
+                    return Err(Error::Parse("missing command".into()));
+                }
+                return Ok(None);
+            }
             's' => self.parse_substitute()?,
             'y' => self.parse_transliterate()?,
             'd' => Command::Delete,
@@ -249,11 +263,7 @@ impl Parser {
             'F' => Command::PrintFileName,
             'e' => {
                 let arg = self.parse_rest_of_line();
-                Command::Execute(if arg.is_empty() {
-                    None
-                } else {
-                    Some(arg)
-                })
+                Command::Execute(if arg.is_empty() { None } else { Some(arg) })
             }
             // GNU `v [version]` asserts a minimum sed version and enables
             // GNU extensions. They are always on here, so it's a no-op.
@@ -270,10 +280,24 @@ impl Parser {
                 Command::Label(label)
             }
             '#' => {
+                if has_address {
+                    return Err(Error::Parse("comments don't accept any addresses".into()));
+                }
                 self.skip_line();
                 Command::Noop
             }
-            c if c.is_whitespace() => return self.parse_one_command(),
+            ';' => {
+                if has_address {
+                    return Err(Error::Parse("missing command".into()));
+                }
+                return self.parse_one_command();
+            }
+            c if c.is_whitespace() => {
+                if has_address {
+                    return Err(Error::Parse("missing command".into()));
+                }
+                return self.parse_one_command();
+            }
             c => {
                 return Err(Error::Parse(format!("unknown command: '{c}'")));
             }
@@ -288,9 +312,7 @@ impl Parser {
         let Some(addr1) = self.parse_address()? else {
             // Check for negation without address
             if self.consume_if('!') {
-                return Err(Error::Parse(
-                    "'!' without preceding address".into(),
-                ));
+                return Err(Error::Parse("'!' without preceding address".into()));
             }
             return Ok(AddressRange::None);
         };
@@ -299,9 +321,9 @@ impl Parser {
 
         if self.consume_if(',') {
             self.skip_spaces();
-            let addr2 = self.parse_address()?.ok_or_else(|| {
-                Error::Parse("expected address after ','".into())
-            })?;
+            let addr2 = self
+                .parse_address()?
+                .ok_or_else(|| Error::Parse("expected address after ','".into()))?;
             self.skip_spaces();
             let negated = self.consume_if('!');
             Ok(AddressRange::Range {
@@ -340,9 +362,9 @@ impl Parser {
             }
             Some('\\') => {
                 self.advance();
-                let delim = self.advance().ok_or_else(|| {
-                    Error::Parse("expected delimiter after '\\'".into())
-                })?;
+                let delim = self
+                    .advance()
+                    .ok_or_else(|| Error::Parse("expected delimiter after '\\'".into()))?;
                 let pattern = self.parse_regex_delimited(delim)?;
                 Ok(Some(Address::Regex(pattern)))
             }
@@ -438,9 +460,9 @@ impl Parser {
     // -- Command-specific parsing --
 
     fn parse_substitute(&mut self) -> Result<Command> {
-        let delim = self.advance().ok_or_else(|| {
-            Error::Parse("missing delimiter for s command".into())
-        })?;
+        let delim = self
+            .advance()
+            .ok_or_else(|| Error::Parse("missing delimiter for s command".into()))?;
         let pattern = self.parse_regex_delimited(delim)?;
         let replacement = self.parse_replacement_delimited(delim)?;
 
@@ -489,9 +511,9 @@ impl Parser {
     }
 
     fn parse_transliterate(&mut self) -> Result<Command> {
-        let delim = self.advance().ok_or_else(|| {
-            Error::Parse("missing delimiter for y command".into())
-        })?;
+        let delim = self
+            .advance()
+            .ok_or_else(|| Error::Parse("missing delimiter for y command".into()))?;
         let from_str = self.parse_regex_delimited(delim)?;
         let to_str = self.parse_regex_delimited(delim)?;
 
@@ -568,11 +590,7 @@ impl Parser {
                 break;
             }
         }
-        if label.is_empty() {
-            None
-        } else {
-            Some(label)
-        }
+        if label.is_empty() { None } else { Some(label) }
     }
 
     /// Parse a filename argument (for r, w, W commands).
@@ -611,9 +629,7 @@ impl Parser {
         loop {
             self.skip_blanks();
             if self.is_at_end() {
-                return Err(Error::Parse(
-                    "unterminated block (missing '}')".into(),
-                ));
+                return Err(Error::Parse("unterminated block (missing '}')".into()));
             }
             if self.peek() == Some('}') {
                 self.advance();
@@ -780,6 +796,27 @@ mod tests {
             } => {}
             other => panic!("expected Last address, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn address_without_command_is_error() {
+        assert!(parse("123").is_err());
+        assert!(parse("1,5").is_err());
+        assert!(parse("/foo/").is_err());
+        assert!(parse("$").is_err());
+        assert!(parse("1;p").is_err());
+        assert!(parse("1\np").is_err());
+    }
+
+    #[test]
+    fn comment_after_address_is_error() {
+        assert!(parse("1 # comment").is_err());
+    }
+
+    #[test]
+    fn empty_script_is_ok() {
+        assert!(parse("").is_ok());
+        assert!(parse("  \n; # comment\n").is_ok());
     }
 
     #[test]
