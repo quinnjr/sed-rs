@@ -35,7 +35,7 @@ cargo install sed-rs        # installs the `sed` binary
 From source:
 
 ```bash
-git clone https://github.com/pegasusheavy/sed-rs.git
+git clone https://github.com/quinnjr/sed-rs.git
 cd sed-rs
 cargo build --release       # → target/release/sed
 ```
@@ -175,4 +175,4 @@ Built on ideas and code adapted from [`sd`](https://github.com/chmln/sd) by [Gre
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
 
-Copyright © 2026 Pegasus Heavy Industries LLC
+Copyright © 2026 Joseph R. Quinn
