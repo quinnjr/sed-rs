@@ -1491,6 +1491,29 @@ mod tests {
         assert_eq!(run_sed("/b/c GONE", "a\nb\nc\n"), "a\nGONE\nc\n");
     }
 
+    /// Indentation in inserted text is load-bearing for anything with syntax
+    /// built on it, so `a\`/`i\`/`c\` must emit the whitespace rather than eat it.
+    /// The one-line `a text` form is the opposite: there the run of spaces
+    /// separates and is dropped.
+    #[test]
+    fn text_commands_preserve_indentation() {
+        for (script, input, want) in [
+            // After a backslash the whitespace is content.
+            (r"1a\    deep", "X\n", "X\n    deep\n"),
+            ("1a\\\n    deep", "X\n", "X\n    deep\n"),
+            (r"1i\    deep", "X\n", "    deep\nX\n"),
+            (r"1c\    deep", "X\n", "    deep\n"),
+            (r"1c\    deep", "A\nB\n", "    deep\nB\n"),
+            // Whitespace-only text still emits its line.
+            ("1a\\ ", "X\n", "X\n \n"),
+            // Without a backslash the whole run separates.
+            ("1a    deep", "X\n", "X\ndeep\n"),
+            ("1i    deep", "X\n", "deep\nX\n"),
+        ] {
+            assert_eq!(run_sed(script, input), want, "script: {script:?}");
+        }
+    }
+
     // -- P command --
 
     #[test]

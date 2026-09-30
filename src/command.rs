@@ -538,21 +538,33 @@ impl Parser {
     ///   a text       (GNU extension: text on same line)
     ///   a\ text      (text after backslash)
     ///   a\           (text on next line, with backslash continuation)
+    ///
+    /// Whitespace after the command is a separator in the first form and part
+    /// of the text in the other two, so the backslash has to be remembered
+    /// before it is consumed:
+    ///
+    /// ```text
+    ///   a    text     => "text"     the run of spaces separates
+    ///   a\   text     => "   text"  the spaces are the first line
+    ///   a\
+    ///     indented   => "indented"
+    /// ```
     fn parse_text_arg(&mut self) -> String {
-        // Skip optional backslash
-        if self.peek() == Some('\\') {
+        // A backslash is what distinguishes the two, so note it before eating it.
+        let escaped = self.consume_if('\\');
+
+        // A newline separates the command from its text either way.
+        if self.peek() == Some('\n') {
             self.advance();
         }
 
-        // Skip one space or newline after command char / backslash
-        match self.peek() {
-            Some('\n') => {
+        // Only the backslash-less GNU form treats the whitespace as a separator,
+        // and then it is the whole run, not just one character: `a    text`
+        // yields "text". After a backslash it is content and must survive.
+        if !escaped {
+            while matches!(self.peek(), Some(' ' | '\t')) {
                 self.advance();
             }
-            Some(' ' | '\t') => {
-                self.advance();
-            }
-            _ => {}
         }
 
         let mut text = String::new();
@@ -783,6 +795,54 @@ mod tests {
         match &cmds[0].command {
             Command::Append(t) => assert_eq!(t, "hello world"),
             other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    /// The text of `a`/`i`/`c` is literal after a backslash, so whitespace
+    /// there is content and has to survive. Without one it is the GNU one-line
+    /// form, where the whole run of whitespace separates and is dropped.
+    #[test]
+    fn text_arg_whitespace_depends_on_the_backslash() {
+        for (script, want) in [
+            // No backslash: the run separates, and the whole of it goes.
+            ("a text", "text"),
+            ("a    text", "text"),
+            ("a \ttext", "text"),
+            // Backslash: the whitespace is the first line of the text.
+            (r"a\ text", " text"),
+            (r"a\    text", "    text"),
+            ("a\\\t\ttext", "\t\ttext"),
+            // Backslash then newline: the newline separates, spaces do not.
+            ("a\\\n  indented", "  indented"),
+            ("a\\\nindented", "indented"),
+            // Whitespace-only text is still text, not nothing.
+            ("a\\ ", " "),
+            ("a\\   ", "   "),
+            ("a\\", ""),
+        ] {
+            let cmds = parse(script).unwrap();
+            match &cmds[0].command {
+                Command::Append(t) => assert_eq!(t, want, "script: {script:?}"),
+                other => panic!("script {script:?}: expected Append, got {other:?}"),
+            }
+        }
+    }
+
+    /// `i` and `c` share the text parser, so they must agree with `a`.
+    #[test]
+    fn insert_and_change_agree_with_append_on_whitespace() {
+        for (script, want) in [
+            (r"i\    deep", "    deep"),
+            (r"c\    deep", "    deep"),
+            ("i    deep", "deep"),
+            ("c    deep", "deep"),
+        ] {
+            let cmds = parse(script).unwrap();
+            let got = match &cmds[0].command {
+                Command::Insert(t) | Command::Change(t) => t.as_str(),
+                other => panic!("script {script:?}: expected Insert/Change, got {other:?}"),
+            };
+            assert_eq!(got, want, "script: {script:?}");
         }
     }
 
