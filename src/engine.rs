@@ -1891,6 +1891,40 @@ mod tests {
         assert_eq!(run_sed(r"s/[\]/X/", "a\\b\n"), "aXb\n");
     }
 
+    // -- delimiter scanning: bracket expressions (GNU/POSIX) --
+
+    #[test]
+    fn class_containing_the_delimiter() {
+        // GNU: a raw delimiter inside [...] is a member, not the pattern's end.
+        assert_eq!(run_sed("s|a[/]b|X|g", "a/b c\n"), "X c\n");
+        assert_eq!(run_sed("s/[^/ ]*/X/g", "foo bar\n"), "X X\n");
+        assert_eq!(
+            run_sed(
+                "s/, impl doc [§0-9][0-9A-Za-z./§-]*//g",
+                "code, impl doc §9abc rest\n"
+            ),
+            "code rest\n"
+        );
+    }
+
+    #[test]
+    fn address_class_containing_the_delimiter() {
+        assert_eq!(
+            run_sed("/[a/]/d", "keep\na/b here\nkeep2\n"),
+            "keep\nkeep2\n"
+        );
+    }
+
+    #[test]
+    fn posix_class_terminator_before_the_delimiter() {
+        assert_eq!(run_sed("s/[[:digit:]/]/Q/g", "a5/bc\n"), "aQQbc\n");
+    }
+
+    #[test]
+    fn closing_bracket_first_is_a_class_member() {
+        assert_eq!(run_sed("s/[]x]//g", "a]b x]y\n"), "ab y\n");
+    }
+
     #[test]
     fn bre_address_pattern() {
         assert_eq!(run_sed(r"/ab\+/d", "abbb\nxyz\n"), "xyz\n");

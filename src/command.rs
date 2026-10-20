@@ -399,8 +399,98 @@ impl Parser {
 
     // -- Delimited content parsing --
 
-    /// Parse content between matching delimiters, handling backslash escapes.
+    /// Parse content between matching delimiters for regexes — `s` patterns
+    /// and address patterns — handling backslash escapes.
+    ///
+    /// Bracket expressions are honoured the way POSIX and GNU sed read them:
+    /// inside `[...]` the delimiter is an ordinary member and does not end the
+    /// pattern, so `s|a[/]b|X|g` and `/[0-9A-Za-z./§-]/` keep their delimiter
+    /// where the author put it. A `]` first in the class (after an optional
+    /// `^`) is a member, and `[:name:]`, `[[.x.]]` and `[[=x=]]` are consumed
+    /// as units so their closing `]` cannot close the class early. Backslash
+    /// is an ordinary character inside a class (POSIX rule) but escapes the
+    /// delimiter outside one.
     fn parse_regex_delimited(&mut self, delim: char) -> Result<String> {
+        let mut s = String::new();
+        let mut in_class = false;
+        // True directly after `[` and after a leading `^`: a `]` there is a
+        // member of the class, not its end.
+        let mut at_class_start = false;
+        loop {
+            match self.advance() {
+                None => {
+                    return Err(Error::Parse(format!(
+                        "unterminated regex (expected closing '{delim}')"
+                    )));
+                }
+                // Outside a class the delimiter closes the pattern; inside a
+                // class it is an ordinary member (POSIX/GNU).
+                Some(c) if c == delim && !in_class => return Ok(s),
+                Some('\\') if !in_class => {
+                    // Escapes (including `\<delim>`) stay verbatim for the
+                    // regex translator downstream to decode.
+                    s.push('\\');
+                    if let Some(next) = self.advance() {
+                        s.push(next);
+                    }
+                }
+                Some('[') if !in_class => {
+                    in_class = true;
+                    at_class_start = true;
+                    s.push('[');
+                }
+                Some('[') if in_class && matches!(self.peek(), Some(':' | '.' | '=')) => {
+                    // POSIX class, collating symbol or equivalence class: one
+                    // unit whose interior may contain the delimiter and whose
+                    // closing `]` must not close the class.
+                    let sep = self.advance().expect("peeked above");
+                    s.push('[');
+                    s.push(sep);
+                    loop {
+                        match self.advance() {
+                            None => {
+                                return Err(Error::Parse(format!(
+                                    "unterminated regex (expected closing '{delim}')"
+                                )));
+                            }
+                            Some(c) if c == sep => {
+                                s.push(c);
+                                if self.peek() == Some(']') {
+                                    s.push(']');
+                                    self.advance();
+                                    break;
+                                }
+                            }
+                            Some(c) => s.push(c),
+                        }
+                    }
+                    at_class_start = false;
+                }
+                // A `]` closes the class unless it comes first in it.
+                Some(']') if in_class && !at_class_start => {
+                    in_class = false;
+                    s.push(']');
+                }
+                Some('^') if in_class && at_class_start => {
+                    // Negation: leaves the class "at start" for a following `]`.
+                    s.push('^');
+                }
+                Some(c) => {
+                    if in_class {
+                        at_class_start = false;
+                    }
+                    s.push(c);
+                }
+            }
+        }
+    }
+
+    /// Parse one side of a `y///` transliteration between matching
+    /// delimiters. `y` has no bracket expressions: `[` is an ordinary
+    /// character and the delimiter closes the side even where brackets look
+    /// unbalanced, which is how GNU sed reads it too. Backslash escapes are
+    /// copied through verbatim.
+    fn parse_transliterate_side(&mut self, delim: char) -> Result<String> {
         let mut s = String::new();
         loop {
             match self.advance() {
@@ -411,17 +501,9 @@ impl Parser {
                 }
                 Some(c) if c == delim => return Ok(s),
                 Some('\\') => {
+                    s.push('\\');
                     if let Some(next) = self.advance() {
-                        if next == delim {
-                            // Escaped delimiter → literal delimiter in regex
-                            s.push('\\');
-                            s.push(next);
-                        } else {
-                            s.push('\\');
-                            s.push(next);
-                        }
-                    } else {
-                        s.push('\\');
+                        s.push(next);
                     }
                 }
                 Some(c) => s.push(c),
@@ -515,8 +597,8 @@ impl Parser {
         let delim = self
             .advance()
             .ok_or_else(|| Error::Parse("missing delimiter for y command".into()))?;
-        let from_str = self.parse_regex_delimited(delim)?;
-        let to_str = self.parse_regex_delimited(delim)?;
+        let from_str = self.parse_transliterate_side(delim)?;
+        let to_str = self.parse_transliterate_side(delim)?;
 
         let from: Vec<char> = from_str.chars().collect();
         let to: Vec<char> = to_str.chars().collect();
@@ -681,6 +763,104 @@ mod tests {
     }
 
     #[test]
+    fn delimiter_inside_bracket_class_is_a_member() {
+        // POSIX/GNU: a raw delimiter inside [...] does not close the pattern.
+        let cmds = parse("s|a[/]b|X|g").unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].command {
+            Command::Substitute(s) => {
+                assert_eq!(s.pattern, "a[/]b");
+                assert_eq!(s.replacement, "X");
+                assert!(s.global);
+            }
+            other => panic!("expected Substitute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delimiter_inside_negated_class_is_a_member() {
+        let cmds = parse("s/[^/ ]*/X/g").unwrap();
+        match &cmds[0].command {
+            Command::Substitute(s) => {
+                assert_eq!(s.pattern, "[^/ ]*");
+                assert_eq!(s.replacement, "X");
+            }
+            other => panic!("expected Substitute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classes_with_delimiters_and_unicode_members() {
+        // The bsed bug report's expression: `/` inside two classes, the
+        // second one also carrying `.`, `-` and `§`.
+        let cmds = parse("s/, impl doc [§0-9][0-9A-Za-z./§-]*//g").unwrap();
+        match &cmds[0].command {
+            Command::Substitute(s) => {
+                assert_eq!(s.pattern, ", impl doc [§0-9][0-9A-Za-z./§-]*");
+                assert_eq!(s.replacement, "");
+                assert!(s.global);
+            }
+            other => panic!("expected Substitute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn posix_class_interior_does_not_close_the_class() {
+        // `]` ends [:digit:], not the class; the delimiter after it is a member.
+        let cmds = parse("s/[[:digit:]/]/Q/g").unwrap();
+        match &cmds[0].command {
+            Command::Substitute(s) => {
+                assert_eq!(s.pattern, "[[:digit:]/]");
+                assert_eq!(s.replacement, "Q");
+            }
+            other => panic!("expected Substitute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closing_bracket_first_is_a_member() {
+        // `]` first in the class (here after `^`) is a literal member.
+        let cmds = parse("s/[^]/]/X/").unwrap();
+        match &cmds[0].command {
+            Command::Substitute(s) => assert_eq!(s.pattern, "[^]/]"),
+            other => panic!("expected Substitute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collating_symbol_is_one_unit() {
+        let cmds = parse("s/[[.a.]]/X/").unwrap();
+        match &cmds[0].command {
+            Command::Substitute(s) => assert_eq!(s.pattern, "[[.a.]]"),
+            other => panic!("expected Substitute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delimiter_inside_address_class() {
+        let cmds = parse("/[a/]/d").unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].address {
+            AddressRange::Single {
+                addr: Address::Regex(re),
+                negated: false,
+            } => assert_eq!(re, "[a/]"),
+            other => panic!("unexpected address: {other:?}"),
+        }
+        match &cmds[0].command {
+            Command::Delete => {}
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unterminated_class_is_an_error() {
+        // Without a closing `]` the class (and with it the pattern) never
+        // ends — GNU sed rejects this script too.
+        assert!(parse("s/[abc/x/").is_err());
+    }
+
+    #[test]
     fn parse_address_line() {
         let cmds = parse("3d").unwrap();
         assert_eq!(cmds.len(), 1);
@@ -757,6 +937,21 @@ mod tests {
             Command::Transliterate { from, to } => {
                 assert_eq!(from, &['a', 'b', 'c']);
                 assert_eq!(to, &['x', 'y', 'z']);
+            }
+            other => panic!("expected Transliterate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transliterate_has_no_bracket_expressions() {
+        // GNU: `[` is an ordinary character to `y` — the delimiter closes
+        // the side even where brackets look unbalanced.
+        let cmds = parse("y/[/x/").unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].command {
+            Command::Transliterate { from, to } => {
+                assert_eq!(from, &['[']);
+                assert_eq!(to, &['x']);
             }
             other => panic!("expected Transliterate, got {other:?}"),
         }
